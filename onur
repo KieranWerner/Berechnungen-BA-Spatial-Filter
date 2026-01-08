@@ -1,0 +1,136 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from PIL import Image
+import os
+
+def load_tiff_image(file_path):
+    """Load a 16-bit TIFF image and convert it to a numpy array."""
+    image = Image.open(file_path)
+    #back = Image.open(r"C:\Users\Onur\Desktop\Messdaten\FScanPP1\backgroundEnd\HocusFocus__40475707__20250203_181417462_0000.tiff")
+    #bg = np.array(back, dtype=np.float64)
+    image_array = np.array(image, dtype=np.float64)#-bg  # Convert to float for calculations
+    image_array[image_array<20]=0 #20fiberIn,6200fiberOut,
+    return image_array
+
+def compute_covariance_matrix(image_array):
+    """Compute the covariance matrix of the laser spot intensity distribution."""
+    height, width = image_array.shape
+    x = np.arange(width)*3.45*1e-3  #5.5*1e-3 ; 3.45*1e-3
+    y = np.arange(height)*3.45*1e-3  #5.5*1e-3 ; 3.45*1e-3
+    X, Y = np.meshgrid(x, y)
+    
+    intensity = image_array / np.sum(image_array)
+    x_mean = np.sum(X * intensity)
+    y_mean = np.sum(Y * intensity)
+    
+    cov_xx = np.sum(intensity * (X - x_mean) ** 2)
+    cov_yy = np.sum(intensity * (Y - y_mean) ** 2)
+    cov_xy = np.sum(intensity * (X - x_mean) * (Y - y_mean))
+    
+    covariance_matrix = np.array([[cov_xx, cov_xy], [cov_xy, cov_yy]])
+    return covariance_matrix, (x_mean, y_mean)
+
+
+
+def plot_laser_spots_with_ellipses(images, covariances, centroids, file_names):
+    """Plot laser spots in 5 figures, each with 10 subplots, and show all figures at once."""
+    num_images = len(images)
+    images_per_fig = 6
+    num_figures = (num_images + images_per_fig - 1) // images_per_fig
+    figures = []
+    
+    for fig_idx in range(num_figures):
+        fig, axes = plt.subplots(2, 3, figsize=(15, 6))  # 2 rows, 5 columns per figure
+        axes = axes.flatten()
+        figures.append(fig)
+        
+        start_idx = fig_idx * images_per_fig
+        end_idx = min(start_idx + images_per_fig, num_images)
+        x_ox = np.array([0,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85])
+        for i, img_idx in enumerate(range(start_idx, end_idx)):
+            image_array = images[img_idx]
+            covariance_matrix = covariances[img_idx]
+            centroid = centroids[img_idx]
+            file_name = file_names[img_idx]
+            ax = axes[i]
+            
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
+            print(eigenvalues)
+            x = [0,1]
+            eig = np.zeros(2)
+            eig[0] = eigenvectors[0][0]
+            eig[1] = eigenvectors[0][1]
+            width, height = 2*np.sqrt(eigenvalues)
+            angle = np.degrees(-covariance_matrix[1,0]/np.sqrt(covariance_matrix[1,0]**2)*np.arccos(np.dot(x,np.abs(eigenvectors[1]))/np.sqrt(np.dot(eigenvectors[1],eigenvectors[1]))))
+            #np.degrees(0.5*np.arctan(2*covariance_matrix[1, 0]/ (covariance_matrix[0, 0]-covariance_matrix[1,1])))
+            #np.degrees(-covariance_matrix[1,0]/np.sqrt(covariance_matrix[1,0]**2)*np.arccos(np.dot(eig, x)/np.dot(eig,eig)))
+            #if covariance_matrix[1,1]== covariance_matrix[0,0]:
+            #    angle = np.degrees(covariance_matrix[1,0]/np.sqrt(covariance_matrix[1,0]**2) * np.pi/4)
+            ax.set_aspect('equal')
+            im=ax.pcolormesh(np.arange(image_array.shape[1])*3.45*1e-3, np.arange(image_array.shape[0])*3.45*1e-3,image_array, cmap='viridis')
+            #ax.scatter(centroid[0], centroid[1], color='cyan', marker='+', label='Centroid')
+            ellipse = Ellipse(centroid, width=width, height=height, angle=angle,
+                              edgecolor='black', facecolor='none', linewidth=2, linestyle='-')
+            #ax.add_patch(ellipse)
+            
+            gaussian_ellipse = Ellipse(centroid, width = 2*width, height = 2*height,
+                                       angle = angle, edgecolor = 'red', facecolor = 'None', linewidth = 2, linestyle = '-')
+            ax.add_patch(gaussian_ellipse)
+
+
+            # Plot major and minor axes
+            for j in range(2):
+                axis_vector = eigenvectors[:, j] * np.sqrt(eigenvalues[j]) * 2
+                ax.plot([centroid[0] - axis_vector[0], centroid[0] + axis_vector[0]],
+                        [centroid[1] - axis_vector[1], centroid[1] + axis_vector[1]],
+                        color='orange' if j == 1 else 'gold', linestyle='-', linewidth=2, 
+                        label='Major Axis' if j == 1 else 'Minor Axis')
+
+            ax.set_title('maj:'+str(round(2*height,2))+'; min:'+str(round(2*width,2)), fontsize=20) #'maj:'+str(round(2*height,2))+'; min:'+str(round(2*width,2)) ; file_name
+            ax.set_xlabel('x [mm]', fontsize=20)
+            ax.set_ylabel('y [mm]', fontsize=20)
+            ax.tick_params(axis='both',labelsize=15)
+            #ax.axis('off')
+
+            #add colorbar
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046,pad=0.04)
+            cbar.ax.tick_params(labelsize=0)
+            cbar.set_label('intensity [arb. units]',fontsize=15)
+        
+        for j in range(i + 1, len(axes)):
+            axes[j].axis('off')  # Hide unused subplots
+        
+        plt.tight_layout(pad=1.05)
+    #plt.savefig(r"C:\Users\Onur\Desktop\Master Thesis\plots\profile.pdf")
+    # Show all figures at once
+    plt.show(block=True)
+
+def process_folder(folder_path):
+    """Process all TIFF images in a folder and plot them in multiple figures."""
+    images = []
+    covariances = []
+    centroids = []
+    eigenvals = []
+    file_names = []
+    major_vals = []
+    minor_vals = []
+    for file_name in sorted(os.listdir(folder_path)):
+        if file_name.lower().endswith('.tiff'):
+            file_path = os.path.join(folder_path, file_name)
+            image_array = load_tiff_image(file_path)
+            covariance_matrix, centroid = compute_covariance_matrix(image_array)
+            images.append(image_array)
+            covariances.append(covariance_matrix)
+            centroids.append(centroid)
+            file_names.append(file_name)
+    
+    if images:
+        plot_laser_spots_with_ellipses(images, covariances, centroids, file_names)
+
+def main():
+    folder_path =   # Update with your folder path
+    process_folder(folder_path)
+
+if __name__ == "__main__":
+    main()
