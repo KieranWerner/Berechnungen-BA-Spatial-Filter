@@ -1,0 +1,635 @@
+from pathlib import Path
+import json
+import csv
+import numpy as np
+import matplotlib
+
+# Kein interaktives GUI-Backend nötig
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# EINSTELLUNGEN
+# ============================================================
+BASE = Path(r"C:\Users\User\Desktop\Theory free propagation")
+
+PHA_FILE = BASE / "average_PHA.csv"
+INT_FILE = BASE / "average_INT.csv"
+
+OUTPUT_DIR = BASE / "angular_spectrum_results"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Propagationsdistanzen in Metern
+Z_LIST_M = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 8.1, 10.0, 12.0, 15.0]
+
+# Wellenlänge
+WAVELENGTH_M = 800e-9
+
+# ------------------------------------------------------------
+# PHASENDEFINITION
+# ------------------------------------------------------------
+# "waves"  -> CSV enthält Phase in Wellen
+# "rad"    -> CSV enthält Phase direkt in Radiant
+PHASE_UNIT = "waves"
+
+# Vorzeichen für Phase
+# U = A * exp(1j * PHASE_SIGN * phase)
+# bei PHASE_UNIT="waves" wird intern mit 2*pi multipliziert
+PHASE_SIGN = -1.0
+
+# ------------------------------------------------------------
+# PIXELGRÖSSE / KALIBRIERUNG
+# ------------------------------------------------------------
+# Möglichkeit A: echte Pixelgröße direkt vorgeben
+USE_DIRECT_PIXEL_SIZE = False
+PIXEL_SIZE_UM = 39.032
+
+# Möglichkeit B: Pixelgröße aus bekanntem D4sigma des Eingangsfelds kalibrieren
+USE_D4SIGMA_CALIBRATION = True
+INPUT_D4SIGMA_MM = 13.7
+
+# ------------------------------------------------------------
+# MASKIERUNG
+# ------------------------------------------------------------
+INTENSITY_THRESHOLD_REL = 0.02
+
+USE_CIRCLE_MASK = True
+CIRCLE_RADIUS_PX = 180
+CIRCLE_CENTER_X = None
+CIRCLE_CENTER_Y = None
+
+# Optionaler Hintergrundabzug
+SUBTRACT_BACKGROUND = False
+BACKGROUND_PERCENTILE = 5.0
+
+# Falls du zusätzlich auch "ohne Phase" rechnen willst
+CALCULATE_WITHOUT_PHASE = True
+
+
+# ============================================================
+# DATEIIMPORT
+# ============================================================
+def load_csv_auto(path: Path) -> np.ndarray:
+    for delim in [",", ";", "\t"]:
+        try:
+            arr = np.loadtxt(path, delimiter=delim)
+            if arr.ndim == 2 and arr.size > 0:
+                return np.asarray(arr, dtype=float)
+        except Exception:
+            pass
+    raise ValueError(f"Could not parse file: {path}")
+
+
+# ============================================================
+# VORVERARBEITUNG
+# ============================================================
+def preprocess_intensity(intensity: np.ndarray,
+                         subtract_background: bool = False,
+                         background_percentile: float = 5.0) -> np.ndarray:
+    I = np.array(intensity, dtype=float, copy=True)
+    I[~np.isfinite(I)] = 0.0
+
+    if subtract_background:
+        bg = np.percentile(I, background_percentile)
+        I = I - bg
+        I[I < 0] = 0.0
+
+    return I
+
+
+def make_valid_mask(intensity, threshold_rel=0.02, use_circle=True,
+                    circle_radius_px=180, cx=None, cy=None):
+    intensity = np.asarray(intensity, dtype=float)
+
+    peak = np.nanmax(intensity)
+    if not np.isfinite(peak) or peak <= 0:
+        raise ValueError("Intensity maximum is invalid or <= 0.")
+
+    thr = threshold_rel * peak
+    valid = np.isfinite(intensity) & (intensity > thr)
+
+    ny, nx = intensity.shape
+    Y, X = np.indices((ny, nx))
+
+    if cx is None:
+        cx = (nx - 1) / 2.0
+    if cy is None:
+        cy = (ny - 1) / 2.0
+
+    if use_circle:
+        circle = (X - cx) ** 2 + (Y - cy) ** 2 <= circle_radius_px ** 2
+        valid &= circle
+
+    if not np.any(valid):
+        raise ValueError("Valid mask is empty. Adjust threshold or circle mask.")
+
+    return valid, float(thr), float(cx), float(cy)
+
+
+# ============================================================
+# FELDAUFBAU
+# ============================================================
+def build_field_from_measurement(intensity, valid_mask, phase_data=None,
+                                 use_phase=True, phase_sign=-1.0,
+                                 phase_unit="waves"):
+    intensity = np.asarray(intensity, dtype=float)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+
+    if not np.any(valid_mask):
+        raise ValueError("Valid mask is empty.")
+
+    int_norm = np.zeros_like(intensity, dtype=float)
+    int_norm[valid_mask] = intensity[valid_mask] / np.nanmax(intensity[valid_mask])
+
+    amplitude = np.zeros_like(intensity, dtype=float)
+    amplitude[valid_mask] = np.sqrt(int_norm[valid_mask])
+
+    if not use_phase:
+        return amplitude.astype(np.complex128), int_norm
+
+    if phase_data is None:
+        raise ValueError("phase_data is required when use_phase=True")
+
+    phase_data = np.asarray(phase_data, dtype=float)
+    phase_clean = np.zeros_like(phase_data, dtype=float)
+    phase_clean[valid_mask] = phase_data[valid_mask]
+
+    if phase_unit.lower() == "waves":
+        phase_rad = phase_sign * 2.0 * np.pi * phase_clean
+    elif phase_unit.lower() == "rad":
+        phase_rad = phase_sign * phase_clean
+    else:
+        raise ValueError("phase_unit must be 'waves' or 'rad'")
+
+    U0 = amplitude * np.exp(1j * phase_rad)
+    return U0, int_norm
+
+
+# ============================================================
+# ANGULAR SPECTRUM PROPAGATION
+# ============================================================
+def angular_spectrum(U0, dx, dy, wavelength, z, pad_factor=4):
+    ny, nx = U0.shape
+
+    py = int((pad_factor - 1) * ny / 2)
+    px = int((pad_factor - 1) * nx / 2)
+
+    U = np.pad(U0, ((py, py), (px, px)), mode="constant")
+    Ny, Nx = U.shape
+
+    fx = np.fft.fftfreq(Nx, d=dx)
+    fy = np.fft.fftfreq(Ny, d=dy)
+    FX, FY = np.meshgrid(fx, fy)
+
+    k = 2.0 * np.pi / wavelength
+    kx = 2.0 * np.pi * FX
+    ky = 2.0 * np.pi * FY
+
+    kz_sq = k**2 - kx**2 - ky**2
+
+    # propagierende + evaneszente Anteile
+    kz = np.zeros_like(kz_sq, dtype=np.complex128)
+    propagating = kz_sq >= 0
+    kz[propagating] = np.sqrt(kz_sq[propagating])
+    kz[~propagating] = 1j * np.sqrt(-kz_sq[~propagating])
+
+    H = np.exp(1j * kz * z)
+
+    Uz = np.fft.ifft2(np.fft.fft2(U) * H)
+    return Uz[py:py + ny, px:px + nx]
+
+
+# ============================================================
+# BEAM-SIZE-METRIKEN
+# ============================================================
+def _centroid_pixels(I):
+    I = np.clip(np.asarray(I, float), 0, None)
+    P = I.sum()
+    if P <= 0:
+        raise ValueError("Intensity sum is zero; metrics cannot be computed.")
+
+    y = np.arange(I.shape[0])
+    x = np.arange(I.shape[1])
+    X, Y = np.meshgrid(x, y)
+
+    x0 = float((I * X).sum() / P)
+    y0 = float((I * Y).sum() / P)
+    return x0, y0, P, X, Y
+
+
+def _encircled_energy_radius(I, R, frac, P):
+    order = np.argsort(R.ravel())
+    r_sorted = R.ravel()[order]
+    i_sorted = I.ravel()[order]
+    cdf = np.cumsum(i_sorted) / P
+    idx = min(np.searchsorted(cdf, frac), len(r_sorted) - 1)
+    return float(r_sorted[idx])
+
+
+def _area_equivalent_diameter(I, dx, dy, rel_threshold):
+    peak = float(np.max(I))
+    if peak <= 0:
+        return np.nan
+
+    mask = I >= (rel_threshold * peak)
+    area = float(mask.sum()) * dx * dy
+    if area <= 0:
+        return np.nan
+
+    return float(np.sqrt(4.0 * area / np.pi))
+
+
+def _fwhm_1d(axis_coords, profile):
+    profile = np.asarray(profile, dtype=float)
+    if profile.size < 2:
+        return np.nan
+
+    peak = float(np.max(profile))
+    if peak <= 0:
+        return np.nan
+
+    half = 0.5 * peak
+    idx = np.where(profile >= half)[0]
+    if idx.size < 2:
+        return np.nan
+
+    i_left = int(idx[0])
+    i_right = int(idx[-1])
+
+    if i_left > 0:
+        x1, x2 = axis_coords[i_left - 1], axis_coords[i_left]
+        y1, y2 = profile[i_left - 1], profile[i_left]
+        if y2 != y1:
+            left = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            left = axis_coords[i_left]
+    else:
+        left = axis_coords[i_left]
+
+    if i_right < profile.size - 1:
+        x1, x2 = axis_coords[i_right], axis_coords[i_right + 1]
+        y1, y2 = profile[i_right], profile[i_right + 1]
+        if y2 != y1:
+            right = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            right = axis_coords[i_right]
+    else:
+        right = axis_coords[i_right]
+
+    return float(right - left)
+
+
+def beam_metrics_units(I, dx, dy):
+    I = np.clip(np.asarray(I, float), 0, None)
+    x0_px, y0_px, P, X, Y = _centroid_pixels(I)
+
+    Xc = (X - x0_px) * dx
+    Yc = (Y - y0_px) * dy
+    R = np.sqrt(Xc**2 + Yc**2)
+
+    sigma_x = float(np.sqrt((I * Xc**2).sum() / P))
+    sigma_y = float(np.sqrt((I * Yc**2).sum() / P))
+
+    d4sigma_x = 4.0 * sigma_x
+    d4sigma_y = 4.0 * sigma_y
+    d4sigma_avg = 0.5 * (d4sigma_x + d4sigma_y)
+
+    r50 = _encircled_energy_radius(I, R, 0.50, P)
+    r86 = _encircled_energy_radius(I, R, 0.86, P)
+
+    d_ee50 = 2.0 * r50
+    d_ee86 = 2.0 * r86
+
+    d_area_50pct = _area_equivalent_diameter(I, dx, dy, 0.50)
+    d_area_13p5pct = _area_equivalent_diameter(I, dx, dy, 0.135)
+
+    x_axis = np.arange(I.shape[1]) * dx
+    y_axis = np.arange(I.shape[0]) * dy
+
+    cx_i = int(round(x0_px))
+    cy_i = int(round(y0_px))
+    cx_i = np.clip(cx_i, 0, I.shape[1] - 1)
+    cy_i = np.clip(cy_i, 0, I.shape[0] - 1)
+
+    profile_x = I[cy_i, :]
+    profile_y = I[:, cx_i]
+
+    fwhm_x = _fwhm_1d(x_axis, profile_x)
+    fwhm_y = _fwhm_1d(y_axis, profile_y)
+    fwhm_avg = 0.5 * (fwhm_x + fwhm_y)
+
+    return {
+        "centroid_x": x0_px * dx,
+        "centroid_y": y0_px * dy,
+        "d4sigma_x": d4sigma_x,
+        "d4sigma_y": d4sigma_y,
+        "d4sigma_avg": d4sigma_avg,
+        "d_ee50": d_ee50,
+        "d_ee86": d_ee86,
+        "d_area_50pct": d_area_50pct,
+        "d_area_13p5pct": d_area_13p5pct,
+        "fwhm_x": fwhm_x,
+        "fwhm_y": fwhm_y,
+        "fwhm_avg": fwhm_avg,
+    }
+
+
+# ============================================================
+# KALIBRIERUNG DER PIXELGRÖSSE
+# ============================================================
+def determine_pixel_size_m(intensity, valid_mask):
+    if USE_DIRECT_PIXEL_SIZE and not USE_D4SIGMA_CALIBRATION:
+        return PIXEL_SIZE_UM * 1e-6
+
+    if USE_D4SIGMA_CALIBRATION:
+        int_norm_for_scale = np.zeros_like(intensity, dtype=float)
+        int_norm_for_scale[valid_mask] = (
+            intensity[valid_mask] / np.nanmax(intensity[valid_mask])
+        )
+
+        tmp_px = beam_metrics_units(int_norm_for_scale, 1.0, 1.0)
+        input_d4_px = tmp_px["d4sigma_avg"]
+
+        if not np.isfinite(input_d4_px) or input_d4_px <= 0:
+            raise ValueError("Could not determine D4sigma in pixels for calibration.")
+
+        return (INPUT_D4SIGMA_MM / input_d4_px) * 1e-3
+
+    raise ValueError("Choose either direct pixel size or D4sigma calibration.")
+
+
+# ============================================================
+# PROPAGATION + AUSWERTUNG
+# ============================================================
+def propagate_and_analyze(label, U0, dx_m, dy_m, wavelength_m, z_list_m, output_dir):
+    rows = []
+    all_intensities = []
+
+    for z in z_list_m:
+        Uz = U0 if z == 0 else angular_spectrum(U0, dx_m, dy_m, wavelength_m, z, pad_factor=4)
+        Iz = np.abs(Uz) ** 2
+        m = beam_metrics_units(Iz, dx_m, dy_m)
+
+        row = {
+            "mode": label,
+            "z_m": float(z),
+            "centroid_x_mm": m["centroid_x"] * 1e3,
+            "centroid_y_mm": m["centroid_y"] * 1e3,
+            "D4sigma_avg_mm": m["d4sigma_avg"] * 1e3,
+            "D_EE50_mm": m["d_ee50"] * 1e3,
+            "D_EE86_mm": m["d_ee86"] * 1e3,
+            "D_area_50pct_mm": m["d_area_50pct"] * 1e3,
+            "D_area_13p5pct_mm": m["d_area_13p5pct"] * 1e3,
+            "FWHM_avg_mm": m["fwhm_avg"] * 1e3,
+        }
+        rows.append(row)
+        all_intensities.append((z, Iz))
+
+    csv_path = output_dir / f"beam_size_vs_z_{label}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    json_path = output_dir / f"beam_size_vs_z_{label}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "mode": label,
+            "pixel_size_um": dx_m * 1e6,
+            "wavelength_nm": wavelength_m * 1e9,
+            "rows": rows
+        }, f, indent=2)
+
+    return rows, all_intensities
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+def save_size_plot(rows_with_phase, rows_without_phase, output_dir):
+    plt.figure(figsize=(11, 7))
+
+    z_with = [r["z_m"] for r in rows_with_phase]
+    plt.plot(z_with, [r["D4sigma_avg_mm"] for r in rows_with_phase],
+             marker="o", label="D4sigma_avg (with phase)")
+    plt.plot(z_with, [r["D_EE50_mm"] for r in rows_with_phase],
+             marker="s", label="D_EE50 (with phase)")
+    plt.plot(z_with, [r["D_EE86_mm"] for r in rows_with_phase],
+             marker="^", label="D_EE86 (with phase)")
+    plt.plot(z_with, [r["D_area_50pct_mm"] for r in rows_with_phase],
+             marker="d", label="D_area_50pct (with phase)")
+    plt.plot(z_with, [r["D_area_13p5pct_mm"] for r in rows_with_phase],
+             marker="v", label="D_area_13p5pct (with phase)")
+    plt.plot(z_with, [r["FWHM_avg_mm"] for r in rows_with_phase],
+             marker="P", label="FWHM_avg (with phase)")
+
+    if rows_without_phase is None:
+        z_without = [r["z_m"] for r in rows_without_phase]
+        plt.plot(z_without, [r["D4sigma_avg_mm"] for r in rows_without_phase],
+                 marker="o", linestyle="--", label="D4sigma_avg (without phase)")
+        plt.plot(z_without, [r["D_EE50_mm"] for r in rows_without_phase],
+                 marker="s", linestyle="--", label="D_EE50 (without phase)")
+        plt.plot(z_without, [r["D_EE86_mm"] for r in rows_without_phase],
+                 marker="^", linestyle="--", label="D_EE86 (without phase)")
+        plt.plot(z_without, [r["D_area_50pct_mm"] for r in rows_without_phase],
+                 marker="d", linestyle="--", label="D_area_50pct (without phase)")
+        plt.plot(z_without, [r["D_area_13p5pct_mm"] for r in rows_without_phase],
+                 marker="v", linestyle="--", label="D_area_13p5pct (without phase)")
+        plt.plot(z_without, [r["FWHM_avg_mm"] for r in rows_without_phase],
+                 marker="P", linestyle="--", label="FWHM_avg (without phase)")
+
+    plt.xlabel("Propagation distance z [m]")
+    plt.ylabel("Beam size [mm]")
+    plt.title("Beam size versus propagation distance")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    plt.savefig(output_dir / "beam_size_vs_z_6_definitions.png", dpi=180)
+    plt.close()
+
+
+def save_input_diagnostics(intensity, int_norm, phase_data, valid_mask, output_dir):
+    plt.figure(figsize=(6, 5))
+    plt.imshow(intensity, origin="lower")
+    plt.colorbar(label="Intensity")
+    plt.title("Input intensity")
+    plt.tight_layout()
+    plt.savefig(output_dir / "input_intensity_raw.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(int_norm, origin="lower")
+    plt.colorbar(label="Normalized intensity")
+    plt.title("Input normalized intensity (masked)")
+    plt.tight_layout()
+    plt.savefig(output_dir / "input_intensity_masked.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(6, 5))
+    phase_plot = np.full_like(phase_data, np.nan, dtype=float)
+    phase_plot[valid_mask] = phase_data[valid_mask]
+    plt.imshow(phase_plot, origin="lower")
+    plt.colorbar(label=f"Phase [{PHASE_UNIT}]")
+    plt.title("Input phase map (masked)")
+    plt.tight_layout()
+    plt.savefig(output_dir / "input_phase_masked.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(valid_mask.astype(float), origin="lower")
+    plt.colorbar(label="Valid mask")
+    plt.title("Aperture mask")
+    plt.tight_layout()
+    plt.savefig(output_dir / "aperture_mask.png", dpi=180)
+    plt.close()
+
+
+def save_selected_propagated_intensities(intensity_stack, output_dir, prefix, count=4):
+    if len(intensity_stack) == 0:
+        return
+
+    idxs = np.linspace(0, len(intensity_stack) - 1, min(count, len(intensity_stack)), dtype=int)
+
+    for i in idxs:
+        z, I = intensity_stack[i]
+        plt.figure(figsize=(6, 5))
+        plt.imshow(I, origin="lower")
+        plt.colorbar(label="Intensity")
+        plt.title(f"{prefix}: propagated intensity at z = {z:.3f} m")
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{prefix}_intensity_z_{z:.3f}m.png", dpi=180)
+        plt.close()
+
+
+# ============================================================
+# HAUPTPROGRAMM
+# ============================================================
+def main():
+    phase_data = load_csv_auto(PHA_FILE)
+    intensity_raw = load_csv_auto(INT_FILE)
+
+    if phase_data.shape != intensity_raw.shape:
+        raise ValueError(
+            f"Shape mismatch: phase {phase_data.shape} vs intensity {intensity_raw.shape}"
+        )
+
+    intensity = preprocess_intensity(
+        intensity_raw,
+        subtract_background=SUBTRACT_BACKGROUND,
+        background_percentile=BACKGROUND_PERCENTILE,
+    )
+
+    valid_mask, threshold_abs, cx, cy = make_valid_mask(
+        intensity=intensity,
+        threshold_rel=INTENSITY_THRESHOLD_REL,
+        use_circle=USE_CIRCLE_MASK,
+        circle_radius_px=CIRCLE_RADIUS_PX,
+        cx=CIRCLE_CENTER_X,
+        cy=CIRCLE_CENTER_Y,
+    )
+
+    dx_m = determine_pixel_size_m(intensity, valid_mask)
+    dy_m = dx_m
+
+    U0_with_phase, int_norm = build_field_from_measurement(
+        intensity=intensity,
+        valid_mask=valid_mask,
+        phase_data=phase_data,
+        use_phase=True,
+        phase_sign=PHASE_SIGN,
+        phase_unit=PHASE_UNIT,
+    )
+
+    rows_with_phase, stack_with_phase = propagate_and_analyze(
+        label="with_phase",
+        U0=U0_with_phase,
+        dx_m=dx_m,
+        dy_m=dy_m,
+        wavelength_m=WAVELENGTH_M,
+        z_list_m=Z_LIST_M,
+        output_dir=OUTPUT_DIR,
+    )
+
+    rows_without_phase = None
+    stack_without_phase = None
+
+    if CALCULATE_WITHOUT_PHASE:
+        U0_without_phase, _ = build_field_from_measurement(
+            intensity=intensity,
+            valid_mask=valid_mask,
+            phase_data=None,
+            use_phase=False,
+            phase_sign=PHASE_SIGN,
+            phase_unit=PHASE_UNIT,
+        )
+
+        rows_without_phase, stack_without_phase = propagate_and_analyze(
+            label="without_phase",
+            U0=U0_without_phase,
+            dx_m=dx_m,
+            dy_m=dy_m,
+            wavelength_m=WAVELENGTH_M,
+            z_list_m=Z_LIST_M,
+            output_dir=OUTPUT_DIR,
+        )
+
+    # kombinierte CSV
+    all_rows = list(rows_with_phase)
+    if rows_without_phase is not None:
+        all_rows += rows_without_phase
+
+    with open(OUTPUT_DIR / "beam_size_vs_z_comparison.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    save_size_plot(rows_with_phase, rows_without_phase, OUTPUT_DIR)
+    save_input_diagnostics(intensity, int_norm, phase_data, valid_mask, OUTPUT_DIR)
+    save_selected_propagated_intensities(stack_with_phase, OUTPUT_DIR, "with_phase", count=4)
+
+    if stack_without_phase is not None:
+        save_selected_propagated_intensities(stack_without_phase, OUTPUT_DIR, "without_phase", count=4)
+
+    meta = {
+        "phase_file": str(PHA_FILE),
+        "intensity_file": str(INT_FILE),
+        "pixel_size_um": dx_m * 1e6,
+        "wavelength_nm": WAVELENGTH_M * 1e9,
+        "phase_unit": PHASE_UNIT,
+        "phase_sign": PHASE_SIGN,
+        "intensity_threshold_rel": INTENSITY_THRESHOLD_REL,
+        "intensity_threshold_abs": threshold_abs,
+        "use_circle_mask": USE_CIRCLE_MASK,
+        "circle_radius_px": CIRCLE_RADIUS_PX,
+        "circle_center_x_px": cx,
+        "circle_center_y_px": cy,
+        "use_direct_pixel_size": USE_DIRECT_PIXEL_SIZE,
+        "pixel_size_input_um": PIXEL_SIZE_UM,
+        "use_d4sigma_calibration": USE_D4SIGMA_CALIBRATION,
+        "input_d4sigma_mm": INPUT_D4SIGMA_MM,
+        "subtract_background": SUBTRACT_BACKGROUND,
+        "background_percentile": BACKGROUND_PERCENTILE,
+        "z_list_m": Z_LIST_M,
+        "size_definitions": [
+            "D4sigma_avg",
+            "D_EE50",
+            "D_EE86",
+            "D_area_50pct",
+            "D_area_13p5pct",
+            "FWHM_avg",
+        ],
+    }
+
+    with open(OUTPUT_DIR / "run_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print("Done.")
+    print(f"Pixel size: {dx_m * 1e6:.3f} um")
+    print(f"Threshold abs.: {threshold_abs:.6g}")
+    print(f"Valid pixels: {int(valid_mask.sum())}")
+    print(f"Results written to: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

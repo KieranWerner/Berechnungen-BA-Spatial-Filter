@@ -1,0 +1,53 @@
+import os
+import numpy as np
+from skimage.io import imread, imsave
+
+
+def load_image(path):
+    img = imread(path).astype(np.float64)
+    return img
+
+
+def save_image(path, img, reference_dtype=None):
+    if reference_dtype is not None:
+        if np.issubdtype(reference_dtype, np.integer):
+            info = np.iinfo(reference_dtype)
+            img = np.clip(img, 0, info.max)
+            img = img.astype(reference_dtype)
+        else:
+            img = img.astype(reference_dtype)
+    else:
+        img = img.astype(np.float32)
+
+    imsave(path, img)
+
+
+if __name__ == "__main__":
+    folder = r"C:\Users\User\Desktop\Vergroesserung"
+
+    signal_path = os.path.join(folder, "Vorne phasics.tif")
+    background_path = os.path.join(folder, "single bg.tif")
+    output_path = os.path.join(folder, "Vorne phasics_bg_subtracted2.tiff")
+
+    signal_raw = imread(signal_path)
+    background_raw = imread(background_path)
+
+    signal = signal_raw.astype(np.float64)
+    background = background_raw.astype(np.float64)
+
+    if signal.shape != background.shape:
+        raise ValueError(
+            f"Shape mismatch: signal {signal.shape}, background {background.shape}"
+        )
+
+    corrected = signal - background
+
+    # No negative intensities
+    corrected[corrected < 0] = 0
+
+    save_image(output_path, corrected, reference_dtype=signal_raw.dtype)
+
+    print("Background subtraction finished.")
+    print(f"Signal image     : {signal_path}")
+    print(f"Background image : {background_path}")
+    print(f"Saved output     : {output_path}")

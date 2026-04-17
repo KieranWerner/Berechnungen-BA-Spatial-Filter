@@ -1,0 +1,160 @@
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+INPUT_DIR = Path(r"C:\Users\User\Desktop\Eingabe")
+OUTPUT_DIR = INPUT_DIR
+
+FIG_DPI = 300
+FIGSIZE = (6.5, 5.8)
+CROP_BORDER = 0   # e.g. 20 if you want to crop the outer border
+
+
+# ============================================================
+# READ SID4 .int FILE
+# ============================================================
+def read_sid4_int(file_path: Path) -> np.ndarray:
+    """
+    Read a SID4 .int file and return the image as a 2D NumPy array.
+    """
+    with open(file_path, "r", encoding="latin1") as f:
+        lines = f.readlines()
+
+    grd_index = None
+    height = None
+    width = None
+
+    for i, line in enumerate(lines):
+        if line.startswith("GRD"):
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                raise ValueError(f"Invalid GRD line in file: {file_path}")
+            height = int(parts[1])
+            width = int(parts[2])
+            grd_index = i
+            break
+
+    if grd_index is None:
+        raise ValueError(f"No GRD line found in file: {file_path}")
+
+    values = []
+    for line in lines[grd_index + 1:]:
+        line = line.strip()
+        if not line:
+            continue
+        for item in line.split("\t"):
+            if item != "":
+                values.append(int(item))
+
+    arr = np.array(values, dtype=np.float64)
+
+    expected_size = height * width
+    if arr.size != expected_size:
+        raise ValueError(
+            f"{file_path.name}: expected {expected_size} values, found {arr.size}"
+        )
+
+    return arr.reshape((height, width))
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def crop_if_needed(img: np.ndarray, border: int) -> np.ndarray:
+    if border <= 0:
+        return img
+    return img[border:-border, border:-border]
+
+
+def save_map(
+    img: np.ndarray,
+    out_path: Path,
+    title: str,
+    colorbar_label: str,
+    cmap: str = "gray",
+):
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    im = ax.imshow(img, cmap=cmap, origin="upper")
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("x [pixel]", fontsize=12)
+    ax.set_ylabel("y [pixel]", fontsize=12)
+    ax.tick_params(axis="both", labelsize=10)
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(colorbar_label, fontsize=11)
+    cbar.ax.tick_params(labelsize=10)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    int_files = sorted(INPUT_DIR.glob("*.int"))
+
+    if not int_files:
+        raise FileNotFoundError("No .int files found in the input folder.")
+
+    print(f"Found {len(int_files)} .int files.")
+
+    stack = []
+
+    for i, file_path in enumerate(int_files, start=1):
+        img = read_sid4_int(file_path)
+        img = crop_if_needed(img, CROP_BORDER)
+        stack.append(img)
+
+        if i <= 3:
+            print(f"Example file {i}: {file_path.name}, shape = {img.shape}")
+
+    stack = np.stack(stack, axis=0)
+    mean_intensity = np.mean(stack, axis=0)
+    std_intensity = np.std(stack, axis=0)
+
+    print("Stack shape:", stack.shape)
+
+    # Save numerical data
+    np.save(OUTPUT_DIR / "intensity_stack.npy", stack)
+    np.save(OUTPUT_DIR / "mean_intensity.npy", mean_intensity)
+    np.save(OUTPUT_DIR / "std_intensity.npy", std_intensity)
+
+    # Optional CSV export
+    np.savetxt(OUTPUT_DIR / "mean_intensity.csv", mean_intensity, delimiter=",")
+
+    # Save figures
+    save_map(
+        mean_intensity,
+        OUTPUT_DIR / "mean_intensity.png",
+        "Mean intensity",
+        "intensity value",
+        cmap="gray",
+    )
+
+    save_map(
+        std_intensity,
+        OUTPUT_DIR / "std_intensity.png",
+        "Standard deviation of intensity",
+        "standard deviation",
+        cmap="gray",
+    )
+
+    print("\nFinished.")
+    print(f"Output folder: {OUTPUT_DIR}")
+    print("Saved files:")
+    print(f"  {OUTPUT_DIR / 'intensity_stack.npy'}")
+    print(f"  {OUTPUT_DIR / 'mean_intensity.npy'}")
+    print(f"  {OUTPUT_DIR / 'mean_intensity.png'}")
+
+
+if __name__ == "__main__":
+    main()

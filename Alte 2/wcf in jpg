@@ -1,0 +1,26 @@
+import os
+from PIL import Image
+
+# Ordnerpfad (Windows!)
+folder = r"C:\Users\User\Desktop\2D Beamprofiler lens - Kopie"
+
+
+for filename in os.listdir(folder):
+    if filename.lower().endswith(".wcf"):
+        filepath = os.path.join(folder, filename)
+        
+        try:
+            # Versuch, Datei als Bild zu öffnen
+            img = Image.open(filepath)
+            
+            # Zielname
+            new_name = filename.replace(".wcf", ".jpg")
+            new_path = os.path.join(folder, new_name)
+            
+            # Speichern als JPG
+            img.convert("RGB").save(new_path, "JPEG")
+            
+            print(f"Konvertiert: {filename} → {new_name}")
+        
+        except Exception as e:
+            print(f"Fehler bei {filename}: {e}")

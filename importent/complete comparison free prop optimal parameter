@@ -1,0 +1,1371 @@
+from pathlib import Path
+import json
+import csv
+import math
+from copy import deepcopy
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.ndimage import gaussian_filter, uniform_filter
+
+
+# ============================================================
+# BASIS-KONFIGURATION
+# ============================================================
+
+# -----------------------------
+# Theory: input files
+# -----------------------------
+PHA_FILE = Path(r"C:\Users\User\Desktop\combined PHA front csv\average_PHA no bg substract.csv")
+INT_FILE = Path(r"C:\Users\User\Desktop\combined average INT front bg substracted\average_INT front bg substracted.csv")
+
+THEORY_OUTPUT_DIR = Path(r"C:\Users\User\Desktop\Theory free propagation")
+THEORY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPARE_OUTPUT_DIR = Path(r"C:\Users\User\Desktop\Comparison_plots")
+COMPARE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SCENARIO_OUTPUT_DIR = COMPARE_OUTPUT_DIR / "scenario_runs"
+SCENARIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+INPUT_D4SIGMA_MM = 13.7
+WAVELENGTH_VACUUM_M = 800e-9
+Z_LIST = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 8.1, 10.0, 12.0, 13.5]
+
+INTENSITY_THRESHOLD_REL = 0.02
+THEORY_MODE = "with_phase"   # "with_phase" oder "without_phase"
+
+# Reproduzierbarkeit für zufällige Effekte
+RANDOM_SEED = 12345
+
+# -----------------------------
+# Measurement: beam profiler
+# -----------------------------
+DATASET_NAME = "beamprofiler_front"
+PIXEL_SIZE_MM = 0.011 * 2.1
+UNIT_LABEL = "mm"
+
+MEASUREMENTS = [
+    (0.53, "messung 53cm referenz_bg_subtracted.tiff"),
+    (2.00, "messung 200 cm_bg_subtracted.tiff"),
+    (3.50, "messung 350cm_bg_subtracted.tiff"),
+    (5.00, "messung 500cm_bg_subtracted.tiff"),
+    (7.50, "messung 750cm_bg_subtracted.tiff"),
+    (13.5, "messung ende_bg_subtracted.tiff"),
+]
+
+MEAS_BASE_DIR = Path(r"C:\Users\User\Desktop\2D Beamprofiler background substracted")
+
+# -----------------------------
+# Plot selection
+# -----------------------------
+PLOT_D4SIGMA_AVG = True
+PLOT_D_EE50 = False
+PLOT_D_EE86 = False
+PLOT_D_AREA_50PCT = False
+PLOT_D_AREA_13P5PCT = False
+PLOT_FWHM = False
+
+METRICS = [
+    ("D4sigma_avg_mm", "D4σ"),
+    ("D_EE50_mm", "EE50"),
+    ("D_EE86_mm", "EE86"),
+    ("D_area_50pct_mm", "Area50%"),
+    ("D_area_13p5pct_mm", "Area13.5%"),
+    ("FWHM_mm", "FWHM"),
+]
+
+# ============================================================
+# VERGLEICHS-KONFIGURATION
+# ============================================================
+
+# Hier auswählen, welche Größen für Ranking / Balkendiagramm benutzt werden.
+COMPARISON_METRICS = [
+    "D4sigma_avg_mm",
+]
+
+# Wenn True: in Vergleichsplots nur COMPARISON_METRICS zeigen
+# Wenn False: alle Metriken zeigen, Ranking nutzt trotzdem nur COMPARISON_METRICS
+PLOT_ONLY_SELECTED_METRICS = False
+
+
+CFG = {}
+
+
+# ============================================================
+# DEFAULT-SZENARIO
+# ============================================================
+
+DEFAULT_SCENARIO = {
+    # bisherige Effekte
+    "USE_SOFT_MASK": False,
+    "USE_XML_MASK": False,
+    "USE_PHASE": True,
+    "PHASE_SIGN": -1.0,
+    "USE_EXTRA_PHASE": False,
+    "TILT_X": 0.0,
+    "TILT_Y": 0.0,
+    "DEFOCUS": 0.0,
+    "ASTIG_X": 0.0,
+    "ASTIG_Y": 0.0,
+    "USE_Z_OFFSET": False,
+    "Z_OFFSET_M": 0.0,
+    "USE_DETECTOR": False,
+    "BLUR_SIGMA_PX": 1.2,
+    "BACKGROUND_LEVEL": 0.0,
+    "USE_CIRCLE_MASK": True,
+    "CIRCLE_RADIUS_PX": 180,
+    "CIRCLE_CENTER_X": None,
+    "CIRCLE_CENTER_Y": None,
+
+    # neue Effekte
+    "USE_AIR_REFRACTION": False,
+    "AIR_REF_INDEX": 1.00027,
+
+    "USE_TURBULENCE": False,
+    "TURB_SIGMA_RAD": 0.0,
+    "TURB_CORR_SIGMA_PX": 12.0,
+
+    "USE_SPHERICAL_ABERRATION": False,
+    "SPHERICAL_COEFF": 0.0,
+
+    "USE_COMA": False,
+    "COMA_X": 0.0,
+    "COMA_Y": 0.0,
+
+    "USE_PIXEL_INTEGRATION": False,
+    "PIXEL_BINNING_SIZE": 2,
+
+    "USE_APERTURE_GAUSSIAN": False,
+    "APERTURE_SIGMA_FACTOR": 0.85,
+}
+
+
+# ============================================================
+# SZENARIEN
+# alle bestehenden + neue einzelne Effekte
+# ============================================================
+SCENARIOS = [
+    {
+        "name": "baseline",
+    },
+
+    # --------------------------------------------------------
+    # SOLO: jeweils nur der einzelne optimale Parameter
+    # --------------------------------------------------------
+    {
+        "name": "opt_tilt_x_only",
+        "USE_EXTRA_PHASE": True,
+        "TILT_X": 0.000455,
+    },
+    {
+        "name": "opt_tilt_y_only",
+        "USE_EXTRA_PHASE": True,
+        "TILT_Y": -0.000333,
+    },
+    {
+        "name": "opt_astig_x_only",
+        "USE_EXTRA_PHASE": True,
+        "ASTIG_X": -0.005051,
+    },
+    {
+        "name": "opt_astig_y_only",
+        "USE_EXTRA_PHASE": True,
+        "ASTIG_Y": -0.005051,
+    },
+    {
+        "name": "opt_defocus_only",
+        "USE_EXTRA_PHASE": True,
+        "DEFOCUS": 0.013461,
+    },
+    {
+        "name": "opt_blur_only",
+        "USE_DETECTOR": True,
+        "BLUR_SIGMA_PX": 0.0,
+    },
+    {
+        "name": "opt_z_offset_only",
+        "USE_Z_OFFSET": True,
+        "Z_OFFSET_M": -0.300000,
+    },
+    {
+        "name": "opt_spherical_only",
+        "USE_SPHERICAL_ABERRATION": True,
+        "SPHERICAL_COEFF": -1.0,
+    },
+    {
+        "name": "opt_coma_x_only",
+        "USE_COMA": True,
+        "COMA_X": 1.0,
+        "COMA_Y": 0.0,
+    },
+    {
+        "name": "opt_coma_y_only",
+        "USE_COMA": True,
+        "COMA_X": 0.0,
+        "COMA_Y": 1.0,
+    },
+
+    # --------------------------------------------------------
+    # KOMBI: alle optimalen Parameter OHNE Defocus
+    # --------------------------------------------------------
+    {
+        "name": "opt_all_except_defocus",
+        "USE_EXTRA_PHASE": True,
+        "TILT_X": 0.000455,
+        "TILT_Y": -0.000333,
+        "ASTIG_X": -0.005051,
+        "ASTIG_Y": -0.005051,
+
+        "USE_DETECTOR": True,
+        "BLUR_SIGMA_PX": 0.0,
+
+        "USE_Z_OFFSET": True,
+        "Z_OFFSET_M": -0.300000,
+
+        "USE_SPHERICAL_ABERRATION": True,
+        "SPHERICAL_COEFF": -1.0,
+
+        "USE_COMA": True,
+        "COMA_X": 1.0,
+        "COMA_Y": 1.0,
+    },
+
+    # --------------------------------------------------------
+    # KOMBI: alle optimalen Parameter MIT Defocus
+    # --------------------------------------------------------
+    {
+        "name": "opt_all_with_defocus",
+        "USE_EXTRA_PHASE": True,
+        "TILT_X": 0.000455,
+        "TILT_Y": -0.000333,
+        "DEFOCUS": 0.013461,
+        "ASTIG_X": -0.005051,
+        "ASTIG_Y": -0.005051,
+
+        "USE_DETECTOR": True,
+        "BLUR_SIGMA_PX": 0.0,
+
+        "USE_Z_OFFSET": True,
+        "Z_OFFSET_M": -0.300000,
+
+        "USE_SPHERICAL_ABERRATION": True,
+        "SPHERICAL_COEFF": -1.0,
+
+        "USE_COMA": True,
+        "COMA_X": 1.0,
+        "COMA_Y": 1.0,
+    },
+]
+
+# ============================================================
+# GENERAL HELPER FUNCTIONS
+# ============================================================
+
+def load_csv_auto(path):
+    for delim in [",", ";", "\t"]:
+        try:
+            arr = np.loadtxt(path, delimiter=delim)
+            if arr.ndim == 2 and arr.size > 0:
+                return arr
+        except Exception:
+            pass
+    raise ValueError(f"Could not parse {path}")
+
+
+def load_image(path: Path) -> np.ndarray:
+    return np.array(Image.open(path), dtype=np.float64)
+
+
+def px_to_mm(value_px: float) -> float:
+    return value_px * PIXEL_SIZE_MM
+
+
+def apply_soft_mask(mask, sigma=3.0):
+    soft = gaussian_filter(mask.astype(float), sigma)
+    mx = np.max(soft)
+    if mx > 0:
+        soft /= mx
+    return soft
+
+
+def get_metric_label(metric_name: str) -> str:
+    for m, label in METRICS:
+        if m == metric_name:
+            return label
+    return metric_name
+
+
+def get_active_metrics_for_plot():
+    if PLOT_ONLY_SELECTED_METRICS:
+        return [(m, label) for m, label in METRICS if m in COMPARISON_METRICS]
+    return METRICS
+
+
+def validate_comparison_metrics():
+    valid = {m for m, _ in METRICS}
+    invalid = [m for m in COMPARISON_METRICS if m not in valid]
+    if invalid:
+        raise ValueError(
+            f"Invalid entries in COMPARISON_METRICS: {invalid}. "
+            f"Valid options are: {sorted(valid)}"
+        )
+
+
+def sanitize_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in ("_", "-", ".") else "_" for c in name)
+
+
+def get_wavelength_in_medium():
+    if CFG.get("USE_AIR_REFRACTION", False):
+        return WAVELENGTH_VACUUM_M / float(CFG["AIR_REF_INDEX"])
+    return WAVELENGTH_VACUUM_M
+
+
+# ============================================================
+# COMMON BEAM METRICS
+# ============================================================
+
+def _centroid_pixels(I):
+    I = np.clip(np.asarray(I, float), 0, None)
+    P = I.sum()
+    if P <= 0:
+        raise ValueError("Intensity sum is zero; metrics cannot be computed.")
+
+    y = np.arange(I.shape[0])
+    x = np.arange(I.shape[1])
+    X, Y = np.meshgrid(x, y)
+
+    x0 = float((I * X).sum() / P)
+    y0 = float((I * Y).sum() / P)
+    return x0, y0, P, X, Y
+
+
+def _encircled_energy_radius(I, R, frac, P):
+    order = np.argsort(R.ravel())
+    r_sorted = R.ravel()[order]
+    i_sorted = I.ravel()[order]
+    cdf = np.cumsum(i_sorted) / P
+    idx = min(np.searchsorted(cdf, frac), len(r_sorted) - 1)
+    return float(r_sorted[idx])
+
+
+def _area_equivalent_diameter(I, dx, dy, rel_threshold):
+    peak = float(np.max(I))
+    if peak <= 0:
+        return np.nan
+
+    mask = I >= (rel_threshold * peak)
+    area_m2 = float(mask.sum()) * dx * dy
+    if area_m2 <= 0:
+        return np.nan
+
+    return float(np.sqrt(4.0 * area_m2 / np.pi))
+
+
+def _fwhm_1d(axis_coords, profile):
+    profile = np.asarray(profile, dtype=float)
+    if profile.size < 2:
+        return np.nan
+
+    peak = float(np.max(profile))
+    if peak <= 0:
+        return np.nan
+
+    half = 0.5 * peak
+    idx = np.where(profile >= half)[0]
+    if idx.size < 2:
+        return np.nan
+
+    i_left = int(idx[0])
+    i_right = int(idx[-1])
+
+    if i_left > 0:
+        x1, x2 = axis_coords[i_left - 1], axis_coords[i_left]
+        y1, y2 = profile[i_left - 1], profile[i_left]
+        if y2 != y1:
+            left = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            left = axis_coords[i_left]
+    else:
+        left = axis_coords[i_left]
+
+    if i_right < profile.size - 1:
+        x1, x2 = axis_coords[i_right], axis_coords[i_right + 1]
+        y1, y2 = profile[i_right], profile[i_right + 1]
+        if y2 != y1:
+            right = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            right = axis_coords[i_right]
+    else:
+        right = axis_coords[i_right]
+
+    return float(right - left)
+
+
+def beam_metrics_units(I, dx, dy):
+    I = np.clip(np.asarray(I, float), 0, None)
+    x0_px, y0_px, P, X, Y = _centroid_pixels(I)
+
+    Xc = (X - x0_px) * dx
+    Yc = (Y - y0_px) * dy
+    R = np.sqrt(Xc**2 + Yc**2)
+
+    sigma_x = float(np.sqrt((I * Xc**2).sum() / P))
+    sigma_y = float(np.sqrt((I * Yc**2).sum() / P))
+
+    d4sigma_x = 4.0 * sigma_x
+    d4sigma_y = 4.0 * sigma_y
+    d4sigma_avg = 0.5 * (d4sigma_x + d4sigma_y)
+
+    r50 = _encircled_energy_radius(I, R, 0.50, P)
+    r86 = _encircled_energy_radius(I, R, 0.86, P)
+
+    d_ee50 = 2.0 * r50
+    d_ee86 = 2.0 * r86
+
+    d_area_50pct = _area_equivalent_diameter(I, dx, dy, 0.50)
+    d_area_13p5pct = _area_equivalent_diameter(I, dx, dy, 0.135)
+
+    x_axis = np.arange(I.shape[1]) * dx
+    y_axis = np.arange(I.shape[0]) * dy
+
+    cx_i = int(round(x0_px))
+    cy_i = int(round(y0_px))
+
+    cx_i = np.clip(cx_i, 0, I.shape[1] - 1)
+    cy_i = np.clip(cy_i, 0, I.shape[0] - 1)
+
+    profile_x = I[cy_i, :]
+    profile_y = I[:, cx_i]
+
+    fwhm_x = _fwhm_1d(x_axis, profile_x)
+    fwhm_y = _fwhm_1d(y_axis, profile_y)
+    fwhm_avg = 0.5 * (fwhm_x + fwhm_y)
+
+    return {
+        "centroid_x": x0_px * dx,
+        "centroid_y": y0_px * dy,
+        "d4sigma_x": d4sigma_x,
+        "d4sigma_y": d4sigma_y,
+        "d4sigma_avg": d4sigma_avg,
+        "d_ee50": d_ee50,
+        "d_ee86": d_ee86,
+        "d_area_50pct": d_area_50pct,
+        "d_area_13p5pct": d_area_13p5pct,
+        "fwhm_x": fwhm_x,
+        "fwhm_y": fwhm_y,
+        "fwhm_avg": fwhm_avg,
+    }
+
+
+# ============================================================
+# THEORY FUNCTIONS
+# ============================================================
+
+def angular_spectrum(U0, dx, dy, wavelength, z, pad_factor=4):
+    ny, nx = U0.shape
+
+    py = int((pad_factor - 1) * ny / 2)
+    px = int((pad_factor - 1) * nx / 2)
+
+    U = np.pad(U0, ((py, py), (px, px)), mode="constant")
+    Ny, Nx = U.shape
+
+    fx = np.fft.fftfreq(Nx, d=dx)
+    fy = np.fft.fftfreq(Ny, d=dy)
+    FX, FY = np.meshgrid(fx, fy)
+
+    k = 2 * np.pi / wavelength
+    kx = 2 * np.pi * FX
+    ky = 2 * np.pi * FY
+
+    kz_sq = k**2 - kx**2 - ky**2
+    kz = np.sqrt(np.maximum(kz_sq, 0.0))
+
+    H = np.exp(1j * kz * z)
+    H[kz_sq < 0] = 0.0
+
+    Uz = np.fft.ifft2(np.fft.fft2(U) * H)
+    return Uz[py:py + ny, px:px + nx]
+
+
+def make_valid_mask(intensity, threshold_rel=0.02, use_circle=True,
+                    circle_radius_px=180, cx=None, cy=None):
+    intensity = np.asarray(intensity, dtype=float)
+    thr = threshold_rel * np.nanmax(intensity)
+
+    valid = np.isfinite(intensity) & (intensity > thr)
+
+    ny, nx = intensity.shape
+    Y, X = np.indices((ny, nx))
+
+    if cx is None:
+        cx = (nx - 1) / 2.0
+    if cy is None:
+        cy = (ny - 1) / 2.0
+
+    if use_circle:
+        circle = (X - cx) ** 2 + (Y - cy) ** 2 <= circle_radius_px ** 2
+        valid = valid & circle
+
+    return valid, float(thr), float(cx), float(cy)
+
+
+def build_field_from_measurement(intensity, valid_mask, phase_waves=None,
+                                 use_phase=True, phase_sign=-1.0):
+    intensity = np.asarray(intensity, dtype=float)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+
+    if not np.any(valid_mask):
+        raise ValueError("Valid mask is empty.")
+
+    int_norm = np.zeros_like(intensity, dtype=float)
+    int_norm[valid_mask] = intensity[valid_mask] / np.nanmax(intensity[valid_mask])
+
+    A = np.sqrt(np.clip(int_norm, 0, None))
+
+    if CFG["USE_SOFT_MASK"]:
+        soft_mask = apply_soft_mask(valid_mask)
+        A *= soft_mask
+    else:
+        A[~valid_mask] = 0.0
+
+    if CFG.get("USE_APERTURE_GAUSSIAN", False):
+        ny, nx = A.shape
+        y, x = np.indices((ny, nx))
+        cx = 0.5 * (nx - 1)
+        cy = 0.5 * (ny - 1)
+        r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        r0 = max(1.0, float(CFG.get("CIRCLE_RADIUS_PX", 180)))
+        sigma = float(CFG.get("APERTURE_SIGMA_FACTOR", 0.85)) * r0
+        ap = np.exp(-(r ** 2) / (2.0 * sigma ** 2))
+        A *= ap
+
+    if CFG["USE_PHASE"] and use_phase:
+        if phase_waves is None:
+            raise ValueError("phase_waves required")
+        phase = np.nan_to_num(phase_waves)
+        phi = CFG["PHASE_SIGN"] * 2.0 * np.pi * phase
+        U0 = A * np.exp(1j * phi)
+    else:
+        U0 = A.astype(np.complex128)
+
+    return U0, int_norm
+
+
+def apply_extra_phase(U0, dx, dy, wavelength):
+    ny, nx = U0.shape
+    x = (np.arange(nx) - nx // 2) * dx
+    y = (np.arange(ny) - ny // 2) * dy
+    X, Y = np.meshgrid(x, y)
+
+    k = 2 * np.pi / wavelength
+    phi = np.zeros_like(X, dtype=float)
+
+    if CFG["USE_EXTRA_PHASE"]:
+        phi += (
+            k * (CFG["TILT_X"] * X + CFG["TILT_Y"] * Y)
+            + k * CFG["DEFOCUS"] * (X ** 2 + Y ** 2)
+            + k * (CFG["ASTIG_X"] * X ** 2 + CFG["ASTIG_Y"] * Y ** 2)
+        )
+
+    if CFG.get("USE_SPHERICAL_ABERRATION", False):
+        scale = max(np.max(np.abs(X)), np.max(np.abs(Y)), 1e-12)
+        Xn = X / scale
+        Yn = Y / scale
+        rho2 = Xn ** 2 + Yn ** 2
+        phi += float(CFG["SPHERICAL_COEFF"]) * rho2 ** 2
+
+    if CFG.get("USE_COMA", False):
+        scale = max(np.max(np.abs(X)), np.max(np.abs(Y)), 1e-12)
+        Xn = X / scale
+        Yn = Y / scale
+        rho2 = Xn ** 2 + Yn ** 2
+        phi += float(CFG["COMA_X"]) * Xn * rho2 + float(CFG["COMA_Y"]) * Yn * rho2
+
+    if CFG.get("USE_TURBULENCE", False):
+        rng = np.random.default_rng(RANDOM_SEED)
+        noise = rng.normal(0.0, 1.0, size=U0.shape)
+        corr_sigma = max(0.1, float(CFG["TURB_CORR_SIGMA_PX"]))
+        noise = gaussian_filter(noise, corr_sigma)
+        std = np.std(noise)
+        if std > 0:
+            noise = noise / std
+        phi += float(CFG["TURB_SIGMA_RAD"]) * noise
+
+    if np.any(phi != 0):
+        return U0 * np.exp(1j * phi)
+    return U0
+
+
+def apply_detector(I):
+    if CFG["USE_DETECTOR"]:
+        I = gaussian_filter(I, CFG["BLUR_SIGMA_PX"])
+        I = I + CFG["BACKGROUND_LEVEL"]
+
+    if CFG.get("USE_PIXEL_INTEGRATION", False):
+        size = max(1, int(CFG["PIXEL_BINNING_SIZE"]))
+        I = uniform_filter(I, size=size, mode="nearest")
+
+    return I
+
+
+def propagate_and_analyze(label, U0, dx_m, dy_m, wavelength_m, z_list, output_dir):
+    rows = []
+
+    for z in z_list:
+        z_eff = z + CFG["Z_OFFSET_M"] if CFG["USE_Z_OFFSET"] else z
+
+        Uz = U0 if z_eff == 0 else angular_spectrum(
+            U0, dx_m, dy_m, wavelength_m, z_eff, pad_factor=4
+        )
+
+        Iz = np.abs(Uz) ** 2
+        Iz = apply_detector(Iz)
+        m = beam_metrics_units(Iz, dx_m, dy_m)
+
+        rows.append({
+            "mode": label,
+            "z_m": z,
+            "centroid_x_mm": m["centroid_x"] * 1e3,
+            "centroid_y_mm": m["centroid_y"] * 1e3,
+            "D4sigma_avg_mm": m["d4sigma_avg"] * 1e3,
+            "D_EE50_mm": m["d_ee50"] * 1e3,
+            "D_EE86_mm": m["d_ee86"] * 1e3,
+            "D_area_50pct_mm": m["d_area_50pct"] * 1e3,
+            "D_area_13p5pct_mm": m["d_area_13p5pct"] * 1e3,
+            "FWHM_mm": m["fwhm_avg"] * 1e3,
+        })
+
+    csv_path = output_dir / f"beam_size_vs_z_{label}.csv"
+    json_path = output_dir / f"beam_size_vs_z_{label}.json"
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "mode": label,
+            "pixel_size_um": dx_m * 1e6,
+            "wavelength_nm": wavelength_m * 1e9,
+            "rows": rows
+        }, f, indent=2)
+
+    return rows
+
+
+def run_theory_for_scenario(output_dir: Path):
+    print("\n" + "=" * 80)
+    print(f"THEORY CALCULATION: {CFG['name']}")
+    print("=" * 80)
+
+    phase_waves = load_csv_auto(PHA_FILE)
+    intensity = load_csv_auto(INT_FILE)
+
+    if phase_waves.shape != intensity.shape:
+        raise ValueError(f"Shape mismatch: phase {phase_waves.shape} vs intensity {intensity.shape}")
+
+    use_circle = CFG.get("USE_CIRCLE_MASK", True)
+    if CFG.get("USE_XML_MASK", False):
+        use_circle = True
+
+    valid_mask, threshold_abs, cx, cy = make_valid_mask(
+        intensity=intensity,
+        threshold_rel=INTENSITY_THRESHOLD_REL,
+        use_circle=use_circle,
+        circle_radius_px=CFG.get("CIRCLE_RADIUS_PX", 180),
+        cx=CFG.get("CIRCLE_CENTER_X", None),
+        cy=CFG.get("CIRCLE_CENTER_Y", None),
+    )
+
+    int_norm_for_scale = np.zeros_like(intensity, dtype=float)
+    int_norm_for_scale[valid_mask] = intensity[valid_mask] / np.nanmax(intensity[valid_mask])
+
+    tmp_px = beam_metrics_units(int_norm_for_scale, 1.0, 1.0)
+    input_d4_px = tmp_px["d4sigma_avg"]
+
+    dx_m = (INPUT_D4SIGMA_MM / input_d4_px) * 1e-3
+    dy_m = dx_m
+
+    wavelength_medium = get_wavelength_in_medium()
+
+    U0_with_phase, _ = build_field_from_measurement(
+        intensity=intensity,
+        valid_mask=valid_mask,
+        phase_waves=phase_waves,
+        use_phase=True,
+        phase_sign=CFG["PHASE_SIGN"],
+    )
+    U0_with_phase = apply_extra_phase(U0_with_phase, dx_m, dy_m, wavelength_medium)
+
+    U0_without_phase, _ = build_field_from_measurement(
+        intensity=intensity,
+        valid_mask=valid_mask,
+        phase_waves=None,
+        use_phase=False,
+        phase_sign=CFG["PHASE_SIGN"],
+    )
+    U0_without_phase = apply_extra_phase(U0_without_phase, dx_m, dy_m, wavelength_medium)
+
+    rows_with_phase = propagate_and_analyze(
+        label="with_phase",
+        U0=U0_with_phase,
+        dx_m=dx_m,
+        dy_m=dy_m,
+        wavelength_m=wavelength_medium,
+        z_list=Z_LIST,
+        output_dir=output_dir,
+    )
+
+    rows_without_phase = propagate_and_analyze(
+        label="without_phase",
+        U0=U0_without_phase,
+        dx_m=dx_m,
+        dy_m=dy_m,
+        wavelength_m=wavelength_medium,
+        z_list=Z_LIST,
+        output_dir=output_dir,
+    )
+
+    all_rows = rows_with_phase + rows_without_phase
+    with open(output_dir / "beam_size_vs_z_comparison.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    plot_rows = []
+    for i, z in enumerate([r["z_m"] for r in rows_with_phase]):
+        plot_rows.append({
+            "z_m": z,
+            "D4sigma_avg_mm_with_phase": rows_with_phase[i]["D4sigma_avg_mm"],
+            "D_EE50_mm_with_phase": rows_with_phase[i]["D_EE50_mm"],
+            "D_EE86_mm_with_phase": rows_with_phase[i]["D_EE86_mm"],
+            "D_area_50pct_mm_with_phase": rows_with_phase[i]["D_area_50pct_mm"],
+            "D_area_13p5pct_mm_with_phase": rows_with_phase[i]["D_area_13p5pct_mm"],
+            "FWHM_mm_with_phase": rows_with_phase[i]["FWHM_mm"],
+            "D4sigma_avg_mm_without_phase": rows_without_phase[i]["D4sigma_avg_mm"],
+            "D_EE50_mm_without_phase": rows_without_phase[i]["D_EE50_mm"],
+            "D_EE86_mm_without_phase": rows_without_phase[i]["D_EE86_mm"],
+            "D_area_50pct_mm_without_phase": rows_without_phase[i]["D_area_50pct_mm"],
+            "D_area_13p5pct_mm_without_phase": rows_without_phase[i]["D_area_13p5pct_mm"],
+            "FWHM_mm_without_phase": rows_without_phase[i]["FWHM_mm"],
+        })
+
+    df_plot = pd.DataFrame(plot_rows)
+    df_plot.to_csv(output_dir / "beam_size_vs_z_plot_data.csv", index=False)
+
+    with open(output_dir / "beam_size_vs_z_plot_data.json", "w", encoding="utf-8") as f:
+        json.dump(plot_rows, f, indent=2)
+
+    meta = {
+        "scenario": CFG,
+        "pixel_size_um": dx_m * 1e6,
+        "input_d4sigma_mm": INPUT_D4SIGMA_MM,
+        "wavelength_vacuum_nm": WAVELENGTH_VACUUM_M * 1e9,
+        "wavelength_medium_nm": wavelength_medium * 1e9,
+        "phase_sign": CFG["PHASE_SIGN"],
+        "intensity_threshold_rel": INTENSITY_THRESHOLD_REL,
+        "intensity_threshold_abs": threshold_abs,
+        "valid_pixels": int(valid_mask.sum()),
+        "circle_center_x_px": cx,
+        "circle_center_y_px": cy,
+    }
+    with open(output_dir / "run_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print("Theory finished.")
+    print(f"Scenario: {CFG['name']}")
+    print(f"Pixel size: {dx_m * 1e6:.3f} um")
+    print(f"Absolute threshold: {threshold_abs:.6g}")
+    print(f"Valid pixels: {int(valid_mask.sum())}")
+    print(f"Wavelength in medium: {wavelength_medium * 1e9:.6f} nm")
+
+    return df_plot
+
+
+# ============================================================
+# MEASUREMENT FUNCTIONS
+# ============================================================
+
+def centroid(img: np.ndarray) -> tuple[float, float]:
+    total = img.sum()
+    if total <= 0:
+        raise ValueError("Image contains no positive total intensity.")
+    y, x = np.indices(img.shape)
+    cx = float((img * x).sum() / total)
+    cy = float((img * y).sum() / total)
+    return cx, cy
+
+
+def d4sigma_avg_px(img: np.ndarray) -> float:
+    total = img.sum()
+    if total <= 0:
+        return np.nan
+
+    y, x = np.indices(img.shape)
+    cx, cy = centroid(img)
+
+    sigma_x = math.sqrt(float((img * (x - cx) ** 2).sum() / total))
+    sigma_y = math.sqrt(float((img * (y - cy) ** 2).sum() / total))
+
+    dx = 4.0 * sigma_x
+    dy = 4.0 * sigma_y
+    return 0.5 * (dx + dy)
+
+
+def encircled_energy_diameter_px(img: np.ndarray, fraction: float) -> float:
+    total = img.sum()
+    if total <= 0:
+        return np.nan
+
+    cx, cy = centroid(img)
+    y, x = np.indices(img.shape)
+
+    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    r_int = np.floor(r).astype(np.int32)
+
+    radial_sum = np.bincount(r_int.ravel(), weights=img.ravel())
+    cum = np.cumsum(radial_sum)
+
+    target = fraction * total
+    idx = np.searchsorted(cum, target)
+
+    if idx <= 0:
+        radius = float(idx)
+    elif idx >= len(cum):
+        return np.nan
+    else:
+        c1 = cum[idx - 1]
+        c2 = cum[idx]
+        if c2 > c1:
+            frac_local = (target - c1) / (c2 - c1)
+        else:
+            frac_local = 0.0
+        radius = (idx - 1) + frac_local
+
+    return 2.0 * float(radius)
+
+
+def fwhm_profile_px(img: np.ndarray) -> float:
+    total = img.sum()
+    if total <= 0:
+        return np.nan
+
+    cx, cy = centroid(img)
+
+    cx_i = int(round(cx))
+    cy_i = int(round(cy))
+
+    cx_i = max(0, min(cx_i, img.shape[1] - 1))
+    cy_i = max(0, min(cy_i, img.shape[0] - 1))
+
+    profile_x = img[cy_i, :]
+    profile_y = img[:, cx_i]
+
+    def single_fwhm(profile: np.ndarray) -> float:
+        peak = float(profile.max())
+        if peak <= 0:
+            return np.nan
+
+        half = peak / 2.0
+        indices = np.where(profile >= half)[0]
+        if len(indices) < 2:
+            return np.nan
+
+        return float(indices[-1] - indices[0])
+
+    fwhm_x = single_fwhm(profile_x)
+    fwhm_y = single_fwhm(profile_y)
+
+    if np.isnan(fwhm_x) and np.isnan(fwhm_y):
+        return np.nan
+    if np.isnan(fwhm_x):
+        return fwhm_y
+    if np.isnan(fwhm_y):
+        return fwhm_x
+
+    return 0.5 * (fwhm_x + fwhm_y)
+
+
+def area_equivalent_diameter_px(img: np.ndarray, rel_threshold: float) -> float:
+    peak = img.max()
+    if peak <= 0:
+        return np.nan
+
+    mask = img >= (rel_threshold * peak)
+    area_px = float(mask.sum())
+
+    if area_px <= 0:
+        return np.nan
+
+    return math.sqrt(4.0 * area_px / math.pi)
+
+
+def run_measurement():
+    print("\n" + "=" * 80)
+    print("MEASUREMENT EVALUATION")
+    print("=" * 80)
+
+    positions_m = []
+    curves = {
+        "D4sigma_avg": [],
+        "D_EE50": [],
+        "D_EE86": [],
+        "D_area_50pct": [],
+        "D_area_13p5pct": [],
+        "FWHM": [],
+    }
+    full_rows = []
+
+    for position_m, filename in MEASUREMENTS:
+        path = MEAS_BASE_DIR / filename
+
+        if not path.exists():
+            print(f"WARNING: File not found: {path}")
+            continue
+
+        img = load_image(path)
+        img = np.clip(img, 0, None)
+        positions_m.append(position_m)
+
+        d4 = px_to_mm(d4sigma_avg_px(img))
+        ee50 = px_to_mm(encircled_energy_diameter_px(img, 0.50))
+        ee86 = px_to_mm(encircled_energy_diameter_px(img, 0.86))
+        area50 = px_to_mm(area_equivalent_diameter_px(img, 0.50))
+        area135 = px_to_mm(area_equivalent_diameter_px(img, 0.135))
+        fwhm = px_to_mm(fwhm_profile_px(img))
+
+        curves["D4sigma_avg"].append(d4)
+        curves["D_EE50"].append(ee50)
+        curves["D_EE86"].append(ee86)
+        curves["D_area_50pct"].append(area50)
+        curves["D_area_13p5pct"].append(area135)
+        curves["FWHM"].append(fwhm)
+
+        full_rows.append({
+            "dataset": DATASET_NAME,
+            "position_m": position_m,
+            "filename": filename,
+            "D4sigma_avg_mm": d4,
+            "D_EE50_mm": ee50,
+            "D_EE86_mm": ee86,
+            "D_area_50pct_mm": area50,
+            "D_area_13p5pct_mm": area135,
+            "FWHM_mm": fwhm,
+        })
+
+        print(
+            f"{filename:35s} | Position = {position_m:5.2f} m | "
+            f"D4sigma_avg = {d4:7.3f} mm | "
+            f"D_EE50 = {ee50:7.3f} mm | "
+            f"D_EE86 = {ee86:7.3f} mm | "
+            f"D_area_50pct = {area50:7.3f} mm | "
+            f"D_area_13p5pct = {area135:7.3f} mm | "
+            f"FWHM = {fwhm:7.3f} mm"
+        )
+
+    if not positions_m:
+        raise RuntimeError("No valid image files found.")
+
+    plot_rows = []
+    for i, pos in enumerate(positions_m):
+        plot_rows.append({
+            "dataset": DATASET_NAME,
+            "position_m": pos,
+            "D4sigma_avg_mm": curves["D4sigma_avg"][i],
+            "D_EE50_mm": curves["D_EE50"][i],
+            "D_EE86_mm": curves["D_EE86"][i],
+            "D_area_50pct_mm": curves["D_area_50pct"][i],
+            "D_area_13p5pct_mm": curves["D_area_13p5pct"][i],
+            "FWHM_mm": curves["FWHM"][i],
+        })
+
+    plot_csv_path = MEAS_BASE_DIR / "beam_size_vs_position_plot_data.csv"
+    with open(plot_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(plot_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(plot_rows)
+
+    plot_json_path = MEAS_BASE_DIR / "beam_size_vs_position_plot_data.json"
+    with open(plot_json_path, "w", encoding="utf-8") as f:
+        json.dump(plot_rows, f, indent=2)
+
+    full_csv_path = MEAS_BASE_DIR / "beam_size_vs_position_full_results.csv"
+    with open(full_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(full_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(full_rows)
+
+    plt.figure(figsize=(10, 6))
+
+    if PLOT_D4SIGMA_AVG:
+        plt.plot(positions_m, curves["D4sigma_avg"], marker="o", label="D4sigma_avg")
+    if PLOT_D_EE50:
+        plt.plot(positions_m, curves["D_EE50"], marker="o", label="D_EE50")
+    if PLOT_D_EE86:
+        plt.plot(positions_m, curves["D_EE86"], marker="o", label="D_EE86")
+    if PLOT_D_AREA_50PCT:
+        plt.plot(positions_m, curves["D_area_50pct"], marker="o", label="D_area_50pct")
+    if PLOT_D_AREA_13P5PCT:
+        plt.plot(positions_m, curves["D_area_13p5pct"], marker="o", label="D_area_13p5pct")
+    if PLOT_FWHM:
+        plt.plot(positions_m, curves["FWHM"], marker="o", label="FWHM")
+
+    plt.xlabel("Position [m]")
+    plt.ylabel(f"Size [{UNIT_LABEL}]")
+    plt.title("Measurement: Beam size versus position")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out_path = MEAS_BASE_DIR / "beam_size_vs_position.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print("Measurement finished.")
+    print(f"Plot saved to: {out_path}")
+    print(f"Plot CSV saved to: {plot_csv_path}")
+    print(f"Plot JSON saved to: {plot_json_path}")
+    print(f"Full CSV saved to: {full_csv_path}")
+
+    return pd.DataFrame(plot_rows)
+
+
+# ============================================================
+# COMPARISON + DIFFERENCE-AUSWERTUNG
+# ============================================================
+
+def calculate_metric_error_stats(diff_values_mm):
+    diff_values_mm = np.asarray(diff_values_mm, dtype=float)
+    diff_values_mm = diff_values_mm[np.isfinite(diff_values_mm)]
+
+    if diff_values_mm.size == 0:
+        return {
+            "mean_signed_diff_mm": np.nan,
+            "mae_mm": np.nan,
+            "rmse_mm": np.nan,
+            "max_abs_diff_mm": np.nan,
+            "n_points": 0,
+        }
+
+    return {
+        "mean_signed_diff_mm": float(np.mean(diff_values_mm)),
+        "mae_mm": float(np.mean(np.abs(diff_values_mm))),
+        "rmse_mm": float(np.sqrt(np.mean(diff_values_mm ** 2))),
+        "max_abs_diff_mm": float(np.max(np.abs(diff_values_mm))),
+        "n_points": int(diff_values_mm.size),
+    }
+
+
+def run_comparison(df_meas: pd.DataFrame, df_theory: pd.DataFrame, scenario_name: str, output_dir: Path):
+    print("\n" + "=" * 80)
+    print(f"COMPARISON: THEORY VS MEASUREMENT | {scenario_name}")
+    print("=" * 80)
+
+    df_meas = df_meas.sort_values("position_m").copy()
+    df_theory = df_theory.sort_values("z_m").copy()
+
+    active_plot_metrics = get_active_metrics_for_plot()
+
+    plt.figure(figsize=(12, 8))
+    diff_rows = []
+
+    for metric, label in active_plot_metrics:
+        theory_col = f"{metric}_{THEORY_MODE}"
+
+        if metric not in df_meas.columns or theory_col not in df_theory.columns:
+            print(f"Skipped: {metric}")
+            continue
+
+        z_meas = df_meas["position_m"].values
+        meas_vals = df_meas[metric].values
+
+        z_theory = df_theory["z_m"].values
+        theory_vals = df_theory[theory_col].values
+
+        theory_interp = np.interp(z_meas, z_theory, theory_vals)
+        diff = meas_vals - theory_interp
+
+        for i in range(len(z_meas)):
+            diff_rows.append({
+                "scenario": scenario_name,
+                "metric": metric,
+                "metric_label": label,
+                "z_m": z_meas[i],
+                "measurement_mm": meas_vals[i],
+                "theory_mm": theory_interp[i],
+                "difference_mm": diff[i],
+                "selected_for_comparison": metric in COMPARISON_METRICS,
+            })
+
+        plt.plot(z_theory, theory_vals, linestyle="-", label=f"{label} Theory")
+        plt.plot(z_meas, meas_vals, linestyle="--", marker="o", label=f"{label} Measurement")
+
+    plt.xlabel("Position / z [m]")
+    plt.ylabel("Beam size [mm]")
+    plt.title(f"Comparison: Theory ({THEORY_MODE}) vs Measurement | {scenario_name}")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9, ncol=2)
+    plt.tight_layout()
+    plt.savefig(output_dir / "comparison_all_curves.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    for metric, label in active_plot_metrics:
+        rows = [r for r in diff_rows if r["metric"] == metric]
+        if not rows:
+            continue
+        z = [r["z_m"] for r in rows]
+        diff = [r["difference_mm"] for r in rows]
+        plt.plot(z, diff, marker="o", linestyle="-", label=f"{label} (Measurement - Theory)")
+
+    plt.axhline(0, color="black", linestyle="--", linewidth=1)
+    plt.xlabel("Position / z [m]")
+    plt.ylabel("Difference [mm]")
+    plt.title(f"Difference: Measurement − Theory | {scenario_name}")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(output_dir / "difference_plot.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    rel_rows = []
+
+    for metric, label in active_plot_metrics:
+        rows = [r for r in diff_rows if r["metric"] == metric]
+        if not rows:
+            continue
+
+        z = []
+        ratio_vals = []
+
+        for r in rows:
+            if r["theory_mm"] == 0:
+                continue
+
+            ratio = r["measurement_mm"] / r["theory_mm"]
+            rel_error = (r["measurement_mm"] - r["theory_mm"]) / r["theory_mm"]
+
+            z.append(r["z_m"])
+            ratio_vals.append(ratio)
+
+            rel_rows.append({
+                "scenario": scenario_name,
+                "metric": metric,
+                "metric_label": label,
+                "z_m": r["z_m"],
+                "measurement_mm": r["measurement_mm"],
+                "theory_mm": r["theory_mm"],
+                "difference_mm": r["difference_mm"],
+                "ratio_meas_over_theory": ratio,
+                "relative_error": rel_error,
+                "selected_for_comparison": metric in COMPARISON_METRICS,
+            })
+
+        plt.plot(z, ratio_vals, marker="o", linestyle="-", label=f"{label} (Measurement/Theory)")
+
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.xlabel("Position / z [m]")
+    plt.ylabel("Measurement / Theory")
+    plt.title(f"Relative deviation (Measurement / Theory) | {scenario_name}")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(output_dir / "relative_ratio_plot.png", dpi=200)
+    plt.close()
+
+    df_diff = pd.DataFrame(diff_rows)
+    df_rel = pd.DataFrame(rel_rows)
+
+    df_diff.to_csv(output_dir / "difference_data.csv", index=False)
+    df_rel.to_csv(output_dir / "ratio_data.csv", index=False)
+
+    with open(output_dir / "difference_data.json", "w", encoding="utf-8") as f:
+        json.dump(diff_rows, f, indent=2)
+
+    with open(output_dir / "ratio_data.json", "w", encoding="utf-8") as f:
+        json.dump(rel_rows, f, indent=2)
+
+    df_diff_selected = df_diff[df_diff["metric"].isin(COMPARISON_METRICS)].copy()
+    df_rel_selected = df_rel[df_rel["metric"].isin(COMPARISON_METRICS)].copy()
+
+    df_diff_selected.to_csv(output_dir / "difference_data_selected_metrics.csv", index=False)
+    df_rel_selected.to_csv(output_dir / "ratio_data_selected_metrics.csv", index=False)
+
+    with open(output_dir / "difference_data_selected_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(df_diff_selected.to_dict(orient="records"), f, indent=2)
+
+    with open(output_dir / "ratio_data_selected_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(df_rel_selected.to_dict(orient="records"), f, indent=2)
+
+    metric_summary_rows = []
+    for metric in COMPARISON_METRICS:
+        label = get_metric_label(metric)
+        vals = df_diff_selected.loc[df_diff_selected["metric"] == metric, "difference_mm"].values
+        stats = calculate_metric_error_stats(vals)
+        metric_summary_rows.append({
+            "scenario": scenario_name,
+            "metric": metric,
+            "label": label,
+            "used_for_ranking": True,
+            **stats
+        })
+
+    df_metric_summary = pd.DataFrame(metric_summary_rows)
+    df_metric_summary.to_csv(output_dir / "difference_summary_selected_metrics.csv", index=False)
+
+    metric_summary_all_rows = []
+    for metric, label in active_plot_metrics:
+        vals = df_diff.loc[df_diff["metric"] == metric, "difference_mm"].values
+        stats = calculate_metric_error_stats(vals)
+        metric_summary_all_rows.append({
+            "scenario": scenario_name,
+            "metric": metric,
+            "label": label,
+            "used_for_ranking": metric in COMPARISON_METRICS,
+            **stats
+        })
+
+    df_metric_summary_all = pd.DataFrame(metric_summary_all_rows)
+    df_metric_summary_all.to_csv(output_dir / "difference_summary_per_metric_all_plotted.csv", index=False)
+
+    overall_stats = calculate_metric_error_stats(df_diff_selected["difference_mm"].values)
+    overall_row = {
+        "scenario": scenario_name,
+        "comparison_metrics": " | ".join(COMPARISON_METRICS),
+        "comparison_metric_labels": " | ".join(get_metric_label(m) for m in COMPARISON_METRICS),
+        **overall_stats
+    }
+    df_overall = pd.DataFrame([overall_row])
+    df_overall.to_csv(output_dir / "difference_summary_overall_selected_metrics.csv", index=False)
+
+    print("Comparison finished.")
+    print(f"Saved to: {output_dir}")
+    print("Comparison metrics used for ranking:")
+    for metric in COMPARISON_METRICS:
+        print(f"  - {metric} ({get_metric_label(metric)})")
+
+    print("Overall difference stats (selected metrics only):")
+    for k, v in overall_row.items():
+        if k in ("scenario", "comparison_metrics", "comparison_metric_labels"):
+            continue
+        if isinstance(v, (int, np.integer)):
+            print(f"  {k}: {v}")
+        else:
+            print(f"  {k}: {v:.6f}")
+
+    return df_diff, df_metric_summary, df_overall
+
+
+# ============================================================
+# SZENARIO-RUNNER
+# ============================================================
+
+def run_all_scenarios():
+    validate_comparison_metrics()
+
+    df_meas = run_measurement()
+
+    all_diff_tables = []
+    all_metric_summaries = []
+    all_overall_summaries = []
+
+    for scenario in SCENARIOS:
+        global CFG
+        CFG = deepcopy(DEFAULT_SCENARIO)
+        CFG.update(scenario)
+
+        scenario_name = sanitize_name(CFG["name"])
+        scenario_dir = SCENARIO_OUTPUT_DIR / scenario_name
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        print("\n" + "#" * 100)
+        print(f"RUN SCENARIO: {scenario_name}")
+        print("#" * 100)
+
+        df_theory = run_theory_for_scenario(output_dir=scenario_dir)
+        df_diff, df_metric_summary, df_overall = run_comparison(
+            df_meas=df_meas,
+            df_theory=df_theory,
+            scenario_name=scenario_name,
+            output_dir=scenario_dir,
+        )
+
+        all_diff_tables.append(df_diff)
+        all_metric_summaries.append(df_metric_summary)
+        all_overall_summaries.append(df_overall)
+
+    df_all_diff = pd.concat(all_diff_tables, ignore_index=True)
+    df_all_metric = pd.concat(all_metric_summaries, ignore_index=True)
+    df_all_overall = pd.concat(all_overall_summaries, ignore_index=True)
+
+    df_all_diff.to_csv(COMPARE_OUTPUT_DIR / "all_scenarios_difference_data.csv", index=False)
+    df_all_metric.to_csv(COMPARE_OUTPUT_DIR / "all_scenarios_metric_summary_selected_metrics.csv", index=False)
+    df_all_overall.to_csv(COMPARE_OUTPUT_DIR / "all_scenarios_overall_summary_selected_metrics.csv", index=False)
+
+    df_rank_rmse = df_all_overall.sort_values("rmse_mm").reset_index(drop=True)
+    df_rank_mae = df_all_overall.sort_values("mae_mm").reset_index(drop=True)
+
+    df_rank_rmse.to_csv(COMPARE_OUTPUT_DIR / "ranking_by_rmse_selected_metrics.csv", index=False)
+    df_rank_mae.to_csv(COMPARE_OUTPUT_DIR / "ranking_by_mae_selected_metrics.csv", index=False)
+
+    plt.figure(figsize=(14, 7))
+    plt.bar(df_rank_rmse["scenario"], df_rank_rmse["rmse_mm"])
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("Overall RMSE [mm]")
+    plt.title(
+        "Ranking of modifications by overall RMSE\n"
+        f"Selected metrics: {', '.join(COMPARISON_METRICS)}"
+    )
+    plt.tight_layout()
+    plt.savefig(COMPARE_OUTPUT_DIR / "ranking_by_rmse_selected_metrics.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(14, 7))
+    plt.bar(df_rank_mae["scenario"], df_rank_mae["mae_mm"])
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("Overall MAE [mm]")
+    plt.title(
+        "Ranking of modifications by overall MAE\n"
+        f"Selected metrics: {', '.join(COMPARISON_METRICS)}"
+    )
+    plt.tight_layout()
+    plt.savefig(COMPARE_OUTPUT_DIR / "ranking_by_mae_selected_metrics.png", dpi=200)
+    plt.close()
+
+    print("\n" + "=" * 100)
+    print("FINAL RANKING BY RMSE")
+    print("=" * 100)
+    print(df_rank_rmse.to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("FINAL RANKING BY MAE")
+    print("=" * 100)
+    print(df_rank_mae.to_string(index=False))
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    run_all_scenarios()
+
+    print("\n" + "=" * 80)
+    print("ALL DONE")
+    print("=" * 80)
+    print(f"Theory output:      {THEORY_OUTPUT_DIR}")
+    print(f"Measurement output: {MEAS_BASE_DIR}")
+    print(f"Comparison output:  {COMPARE_OUTPUT_DIR}")
+    print(f"Scenario output:    {SCENARIO_OUTPUT_DIR}")
+    print(f"Selected metrics:   {COMPARISON_METRICS}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+import csv
+import math
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+# =========================
+# Einstellungen
+# =========================
+
+DEFAULT_FOLDER = Path.home() / "C:/Users/User/Desktop/Real lens propagation"
+
+# Falls du die Pixelgröße kennst, hier eintragen, z.B. 4.65 für 4.65 µm/Pixel.
+# Wenn None, wird in Pixeln geplottet.
+PIXEL_SIZE_UM: float | None = None
+
+# Kandidaten für den Start des Pixelblocks innerhalb eines WCF-Frames.
+CANDIDATE_PIXEL_OFFSETS = [944, 960, 992, 1024, 1152, 1200]
+
+# Schwellen für area-equivalent Diameter relativ zum Peak
+REL_THRESHOLDS = {
+    "D_area_50pct": 0.50,
+    "D_area_13p5pct": math.exp(-2.0),  # ~1/e^2
+}
+
+# Encircled energy targets
+EE_TARGETS = {
+    "D_EE50": 0.50,
+    "D_EE86": 0.865,
+}
+
+
+# =========================
+# Hilfsfunktionen
+# =========================
+
+def u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 4], "little", signed=False)
+
+
+def parse_z_from_filename(path: Path) -> float:
+    """
+    Extrahiert z aus Dateinamen wie:
+    350.wcf, 350cm.wcf, z_350.wcf, scan_350_cm.wcf
+    """
+    stem = path.stem.replace(",", ".")
+    m = re.search(r'(\d+(?:\.\d+)?)', stem)
+    if not m:
+        raise ValueError(f"Keine z-Position im Dateinamen gefunden: {path.name}")
+    return float(m.group(1))
+
+
+def border_values(img: np.ndarray, border: int = 40) -> np.ndarray:
+    top = img[:border, :]
+    bottom = img[-border:, :]
+    left = img[:, :border]
+    right = img[:, -border:]
+    return np.concatenate([top.ravel(), bottom.ravel(), left.ravel(), right.ravel()])
+
+
+def choose_pixel_offset(frame_bytes: bytes, width: int, height: int, candidates: list[int]) -> int:
+    """
+    Wählt den plausibelsten Offset für den Pixelblock.
+    Heuristik:
+    - möglichst wenig Signal am Rand
+    - Maximum soll nicht direkt am Rand liegen
+    """
+    best_offset = None
+    best_score = np.inf
+
+    npx = width * height
+    need = npx * 2
+
+    for off in candidates:
+        if off + need > len(frame_bytes):
+            continue
+
+        img = np.frombuffer(
+            frame_bytes, dtype="<u2", count=npx, offset=off
+        ).reshape(height, width).astype(np.float64)
+
+        b = border_values(img, border=min(40, width // 8, height // 8))
+        center = img[height // 4: 3 * height // 4, width // 4: 3 * width // 4]
+
+        border_mean = float(np.mean(b))
+        center_mean = float(np.mean(center))
+        max_y, max_x = np.unravel_index(np.argmax(img), img.shape)
+
+        on_edge = (max_x < 5 or max_x >= width - 5 or max_y < 5 or max_y >= height - 5)
+        score = border_mean / max(center_mean, 1e-9)
+        if on_edge:
+            score += 0.5
+
+        if score < best_score:
+            best_score = score
+            best_offset = off
+
+    if best_offset is None:
+        raise RuntimeError("Kein plausibler Pixel-Offset im WCF-Frame gefunden.")
+
+    return best_offset
+
+
+def read_wcf_mean_image(path: Path) -> np.ndarray:
+    """
+    Liest eine DataRay-artige WCF-Datei (IRD1-Header) und mittelt alle nutzbaren Frames.
+    """
+    data = path.read_bytes()
+
+    if not data.startswith(b".IRD"):
+        raise RuntimeError(f"{path.name}: Unbekannter WCF-Header (erwartet '.IRD').")
+
+    global_header = u32(data, 8)
+    nominal_frames = u32(data, 12)
+    frame_size = u32(data, 16)
+
+    if global_header <= 0 or frame_size <= 0:
+        raise RuntimeError(f"{path.name}: Ungültiger WCF-Header.")
+
+    if len(data) < global_header + 256:
+        raise RuntimeError(f"{path.name}: Datei zu kurz.")
+
+    first_frame_offset = global_header
+    width = u32(data, first_frame_offset + 20)
+    height = u32(data, first_frame_offset + 24)
+
+    if width <= 0 or height <= 0 or width * height > 10000 * 10000:
+        raise RuntimeError(f"{path.name}: Unplausible Bildgröße: {width} x {height}")
+
+    usable_frames = max(1, min(nominal_frames, (len(data) - global_header) // frame_size))
+    if usable_frames < 1:
+        usable_frames = 1
+
+    first_frame_end = min(len(data), first_frame_offset + frame_size)
+    first_frame = data[first_frame_offset:first_frame_end]
+    pixel_offset = choose_pixel_offset(first_frame, width, height, CANDIDATE_PIXEL_OFFSETS)
+
+    acc = np.zeros((height, width), dtype=np.float64)
+    used = 0
+    bytes_needed = pixel_offset + width * height * 2
+
+    for i in range(usable_frames):
+        f0 = global_header + i * frame_size
+        f1 = min(len(data), f0 + frame_size)
+        frame = data[f0:f1]
+        if len(frame) < bytes_needed:
+            continue
+
+        img = np.frombuffer(
+            frame, dtype="<u2", count=width * height, offset=pixel_offset
+        ).reshape(height, width)
+        acc += img
+        used += 1
+
+    if used == 0:
+        raise RuntimeError(f"{path.name}: Kein vollständiger Frame lesbar.")
+
+    return acc / used
+
+
+def weighted_centroid(img: np.ndarray) -> tuple[float, float]:
+    total = float(img.sum())
+    if total <= 0:
+        raise RuntimeError("Bild hat keine positive Gesamtintensität.")
+
+    y, x = np.indices(img.shape)
+    cx = float((img * x).sum() / total)
+    cy = float((img * y).sum() / total)
+    return cx, cy
+
+
+def second_moment_diameter_avg(img: np.ndarray) -> dict[str, float]:
+    """
+    Gemittelter D4σ-Durchmesser aus x- und y-Richtung:
+    D4sigma_avg = (D4sigma_x + D4sigma_y) / 2
+    """
+    total = float(img.sum())
+    y, x = np.indices(img.shape)
+    cx, cy = weighted_centroid(img)
+
+    dx = x - cx
+    dy = y - cy
+
+    sigma_x = math.sqrt(float((img * dx**2).sum() / total))
+    sigma_y = math.sqrt(float((img * dy**2).sum() / total))
+
+    d4sx = 4.0 * sigma_x
+    d4sy = 4.0 * sigma_y
+    d4s_avg = 0.5 * (d4sx + d4sy)
+
+    return {
+        "D4sigma_avg": d4s_avg,
+    }
+
+
+def encircled_energy_diameter(img: np.ndarray, fraction: float) -> float:
+    cx, cy = weighted_centroid(img)
+    y, x = np.indices(img.shape)
+    r = np.sqrt((x - cx)**2 + (y - cy)**2)
+
+    order = np.argsort(r.ravel())
+    r_sorted = r.ravel()[order]
+    i_sorted = img.ravel()[order]
+
+    cum = np.cumsum(i_sorted)
+    total = cum[-1]
+    target = fraction * total
+
+    idx = int(np.searchsorted(cum, target))
+    idx = min(max(idx, 0), len(r_sorted) - 1)
+    return 2.0 * float(r_sorted[idx])
+
+
+def area_equivalent_diameter(img: np.ndarray, rel_threshold: float) -> float:
+    peak = float(np.max(img))
+    if peak <= 0:
+        return np.nan
+    mask = img >= (rel_threshold * peak)
+    area = float(np.count_nonzero(mask))
+    if area <= 0:
+        return np.nan
+    return 2.0 * math.sqrt(area / math.pi)
+
+
+def compute_metrics(img: np.ndarray) -> dict[str, float]:
+    # Kein Background-Abzug: direkt mit dem gemittelten Bild arbeiten
+    metrics = {}
+    metrics.update(second_moment_diameter_avg(img))
+
+    for name, frac in EE_TARGETS.items():
+        metrics[name] = encircled_energy_diameter(img, frac)
+
+    for name, thr in REL_THRESHOLDS.items():
+        metrics[name] = area_equivalent_diameter(img, thr)
+
+    return metrics
+
+
+def maybe_scale(values: dict[str, float]) -> tuple[dict[str, float], str]:
+    if PIXEL_SIZE_UM is None:
+        return values, "px"
+
+    scaled = {}
+    for k, v in values.items():
+        scaled[k] = v * PIXEL_SIZE_UM / 1000.0  # µm -> mm
+    return scaled, "mm"
+
+
+def main(folder: Path = DEFAULT_FOLDER) -> None:
+    folder = Path(folder).expanduser()
+
+    if not folder.exists():
+        raise SystemExit(f"Ordner nicht gefunden: {folder}")
+
+    files = sorted(folder.glob("*.wcf"))
+    if not files:
+        raise SystemExit(f"Keine .wcf-Dateien gefunden in: {folder}")
+
+    rows = []
+    for path in files:
+        z_cm = parse_z_from_filename(path)
+        img = read_wcf_mean_image(path)
+        metrics = compute_metrics(img)
+        metrics, unit = maybe_scale(metrics)
+
+        row = {"file": path.name, "z_cm": z_cm}
+        row.update(metrics)
+        rows.append(row)
+        print(f"OK: {path.name}")
+
+    rows.sort(key=lambda r: r["z_cm"])
+
+    # CSV speichern
+    csv_path = folder / "beam_size_vs_z.csv"
+    fieldnames = list(rows[0].keys())
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Plot mit genau 5 gemittelten Size-Definitionen
+    z = np.array([r["z_cm"] for r in rows], dtype=float)
+
+    plt.figure(figsize=(11, 7))
+    plot_keys = [
+        "D4sigma_avg",
+        "D_EE50",
+        "D_EE86",
+        "D_area_50pct",
+        "D_area_13p5pct",
+    ]
+
+    for key in plot_keys:
+        y = np.array([r[key] for r in rows], dtype=float)
+        plt.plot(z, y, marker="o", linewidth=2, label=key)
+
+    plt.xlabel("z [cm]")
+    plt.ylabel(f"Beam size [{unit}]")
+    plt.title("Laser beam size in propagation direction")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    plot_path = folder / "beam_size_vs_z.png"
+    plt.savefig(plot_path, dpi=180)
+    plt.show()
+
+    print()
+    print("Fertig.")
+    print(f"CSV:  {csv_path}")
+    print(f"Plot: {plot_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,41 @@
+from pathlib import Path
+import numpy as np
+from PIL import Image
+
+BASE_DIR = Path("C:/Users/User/Desktop/Real free propagation")
+FILES = [
+    "messung 53cm referenz.tiff",
+    "messung 200 cm.tiff",
+    "messung 350cm.tiff",
+    "messung 500cm.tiff",
+    "messung 750cm.tiff",
+    "messung ende.tiff",
+]
+
+LOW_PERCENTILE = 5  # dunkelste 5 % als Hintergrundschätzung
+
+
+def estimate_background_from_dark_pixels(img: np.ndarray, percentile: float = 5) -> float:
+    return float(np.percentile(img, percentile))
+
+
+def subtract_background(img: np.ndarray) -> np.ndarray:
+    bg = estimate_background_from_dark_pixels(img, LOW_PERCENTILE)
+    corrected = img.astype(np.float64) - bg
+    corrected = np.clip(corrected, 0, None)
+    return corrected.astype(np.uint16), bg
+
+
+for filename in FILES:
+    path = BASE_DIR / filename
+    if not path.exists():
+        print(f"Datei nicht gefunden: {path}")
+        continue
+
+    img = np.array(Image.open(path))
+    corrected, bg = subtract_background(img)
+
+    out_path = BASE_DIR / filename.replace(".tiff", "_bg_subtracted.tiff")
+    Image.fromarray(corrected).save(out_path)
+
+    print(f"{filename}: Hintergrund = {bg:.2f} -> gespeichert: {out_path}")

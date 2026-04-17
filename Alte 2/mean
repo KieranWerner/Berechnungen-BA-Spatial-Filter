@@ -1,0 +1,38 @@
+import os
+import numpy as np
+from skimage.io import imread, imsave
+
+# Folder with background images
+folder = r"C:\Users\User\Desktop\Bg tiff"
+
+# Get all TIFF files
+files = [f for f in os.listdir(folder) if f.lower().endswith((".tif", ".tiff"))]
+
+if len(files) == 0:
+    raise ValueError("No TIFF files found in folder!")
+
+print(f"Found {len(files)} files.")
+
+# Load first image to get shape
+first = imread(os.path.join(folder, files[0])).astype(np.float64)
+sum_img = np.zeros_like(first, dtype=np.float64)
+
+# Sum all images
+for i, file in enumerate(files):
+    path = os.path.join(folder, file)
+    img = imread(path).astype(np.float64)
+
+    if img.shape != sum_img.shape:
+        raise ValueError(f"Image {file} has different shape!")
+
+    sum_img += img
+    print(f"Loaded {i+1}/{len(files)}: {file}")
+
+# Compute mean
+mean_img = sum_img / len(files)
+
+# Save result
+output_path = os.path.join(folder, "mean_background.tiff")
+imsave(output_path, mean_img.astype(np.float32))
+
+print(f"\nMean background saved to:\n{output_path}")

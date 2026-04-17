@@ -1,0 +1,205 @@
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# DATEIEN
+# ============================================================
+MEAS_CSV = Path(r"C:\Users\User\Desktop\2D Beamprofiler background substracted\beam_size_vs_position_plot_data.csv")
+THEORY_CSV = Path(r"C:\Users\User\Desktop\Theory free propagation\beam_size_vs_z_plot_data.csv")
+OUTPUT_DIR = Path(r"C:\Users\User\Desktop\Vergleichsplots")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+THEORY_MODE = "with_phase"
+
+METRICS = [
+    ("D4sigma_avg_mm", "D4σ", "blue"),
+    ("D_EE50_mm", "EE50", "orange"),
+    ("D_EE86_mm", "EE86", "green"),
+    ("D_area_50pct_mm", "Area50%", "red"),
+    ("D_area_13p5pct_mm", "Area13.5%", "purple"),
+    ("FWHM_mm", "FWHM", "brown"),
+]
+
+
+def main():
+    df_meas = pd.read_csv(MEAS_CSV).sort_values("position_m")
+    df_theory = pd.read_csv(THEORY_CSV).sort_values("z_m")
+
+    # ========================================================
+    # PLOT 1: Originalkurven
+    # ========================================================
+    plt.figure(figsize=(12, 8))
+
+    # für Differenz speichern
+    diff_rows = []
+
+    for metric, label, color in METRICS:
+        theory_col = f"{metric}_{THEORY_MODE}"
+
+        if metric not in df_meas.columns or theory_col not in df_theory.columns:
+            continue
+
+        z_meas = df_meas["position_m"].values
+        meas_vals = df_meas[metric].values
+
+        z_theory = df_theory["z_m"].values
+        theory_vals = df_theory[theory_col].values
+
+        # ---------------------------------------
+        # INTERPOLATION
+        # ---------------------------------------
+        theory_interp = np.interp(z_meas, z_theory, theory_vals)
+
+        # ---------------------------------------
+        # DIFFERENZ
+        # ---------------------------------------
+        diff = meas_vals - theory_interp
+
+        # speichern für CSV
+        for i in range(len(z_meas)):
+            diff_rows.append({
+                "metric": metric,
+                "z_m": z_meas[i],
+                "measurement_mm": meas_vals[i],
+                "theory_mm": theory_interp[i],
+                "difference_mm": diff[i],
+            })
+
+        # ---------------------------------------
+        # PLOT: Theorie
+        # ---------------------------------------
+        plt.plot(
+            z_theory,
+            theory_vals,
+            linestyle="-",
+            color=color,
+            label=f"{label} Theorie",
+        )
+
+        # ---------------------------------------
+        # PLOT: Messung
+        # ---------------------------------------
+        plt.plot(
+            z_meas,
+            meas_vals,
+            linestyle="--",
+            marker="o",
+            color=color,
+            label=f"{label} Messung",
+        )
+
+    plt.xlabel("Position / z [m]")
+    plt.ylabel("Beamgröße [mm]")
+    plt.title("Vergleich: Theorie vs Messung")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9, ncol=2)
+    plt.tight_layout()
+
+    plt.savefig(OUTPUT_DIR / "comparison_all_curves.png", dpi=200)
+    plt.close()
+
+    # ========================================================
+    # PLOT 2: DIFFERENZ
+    # ========================================================
+    plt.figure(figsize=(12, 6))
+
+    for metric, label, color in METRICS:
+        rows = [r for r in diff_rows if r["metric"] == metric]
+        if not rows:
+            continue
+
+        z = [r["z_m"] for r in rows]
+        diff = [r["difference_mm"] for r in rows]
+
+        plt.plot(
+            z,
+            diff,
+            marker="o",
+            linestyle="-",
+            color=color,
+            label=f"{label} (Messung - Theorie)",
+        )
+
+    plt.axhline(0, color="black", linestyle="--", linewidth=1)
+
+    plt.xlabel("Position / z [m]")
+    plt.ylabel("Differenz [mm]")
+    plt.title("Differenz: Messung − Theorie")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+
+    plt.savefig(OUTPUT_DIR / "difference_plot.png", dpi=200)
+    plt.show()
+
+    # ========================================================
+# PLOT 3: RELATIVE ABWEICHUNG (Messung / Theorie)
+# ========================================================
+    plt.figure(figsize=(12, 6))
+
+    rel_rows = []
+
+    for metric, label, color in METRICS:
+        rows = [r for r in diff_rows if r["metric"] == metric]
+        if not rows:
+            continue
+
+        z = []
+        rel = []
+        rel_diff = []
+
+        for r in rows:
+            if r["theory_mm"] == 0:
+                continue
+
+            ratio = r["measurement_mm"] / r["theory_mm"]
+            rel_error = (r["measurement_mm"] - r["theory_mm"]) / r["theory_mm"]
+
+            z.append(r["z_m"])
+            rel.append(ratio)
+            rel_diff.append(rel_error)
+
+            rel_rows.append({
+                "metric": metric,
+                "z_m": r["z_m"],
+                "measurement_mm": r["measurement_mm"],
+                "theory_mm": r["theory_mm"],
+                "ratio_meas_over_theory": ratio,
+                "relative_error": rel_error,
+            })
+
+        # Plot: Verhältnis
+        plt.plot(
+            z,
+            rel,
+            marker="o",
+            linestyle="-",
+            color=color,
+            label=f"{label} (Messung/Theorie)",
+        )
+
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+
+    plt.xlabel("Position / z [m]")
+    plt.ylabel("Messung / Theorie")
+    plt.title("Relative Abweichung (Messung / Theorie)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+
+    plt.savefig(OUTPUT_DIR / "relative_ratio_plot.png", dpi=200)
+    plt.close()
+        # ========================================================
+    # CSV SPEICHERN
+    # ========================================================
+    df_diff = pd.DataFrame(diff_rows)
+    df_diff.to_csv(OUTPUT_DIR / "difference_data.csv", index=False)
+
+    print("Fertig.")
+    print("Plots + Differenz gespeichert.")
+
+
+if __name__ == "__main__":
+    main()

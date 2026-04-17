@@ -1,0 +1,207 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.io import imread
+from skimage.color import rgb2gray
+from scipy.ndimage import map_coordinates
+
+
+def load_image(path):
+    img = imread(path)
+    if img.ndim == 3:
+        img = rgb2gray(img)
+    img = img.astype(np.float64)
+    img -= np.min(img)
+    maxv = np.max(img)
+    if maxv > 0:
+        img /= maxv
+    return img
+
+
+def find_center(img):
+    y, x = np.indices(img.shape)
+    total = np.sum(img)
+    if total <= 0:
+        return img.shape[1] / 2, img.shape[0] / 2
+    cx = np.sum(x * img) / total
+    cy = np.sum(y * img) / total
+    return cx, cy
+
+
+def extract_line_profile(img, cx, cy, angle_rad, half_length=None, num_points=4000):
+    h, w = img.shape
+
+    if half_length is None:
+        half_length = np.hypot(w, h)
+
+    s = np.linspace(-half_length, half_length, num_points)
+    x = cx + s * np.cos(angle_rad)
+    y = cy + s * np.sin(angle_rad)
+
+    valid = (x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)
+    x_valid = x[valid]
+    y_valid = y[valid]
+    s_valid = s[valid]
+
+    profile = map_coordinates(img, [y_valid, x_valid], order=1, mode="nearest")
+    return s_valid, profile
+
+
+def width_at_threshold(s, profile, threshold):
+    if len(profile) < 2:
+        return np.nan
+
+    peak = np.max(profile)
+    if peak <= 0:
+        return np.nan
+
+    level = threshold * peak
+    indices = np.where(profile >= level)[0]
+
+    if len(indices) < 2:
+        return np.nan
+
+    return s[indices[-1]] - s[indices[0]]
+
+
+def compute_diagonal_widths(img, thresholds):
+    cx, cy = find_center(img)
+
+    # +45°: top-left to bottom-right
+    # -45°: top-right to bottom-left
+    angles = [np.pi / 4, -np.pi / 4]
+    labels = ["diag_left", "diag_right"]
+
+    results = {}
+
+    for angle, label in zip(angles, labels):
+        s, profile = extract_line_profile(img, cx, cy, angle)
+        widths_px = [width_at_threshold(s, profile, t) for t in thresholds]
+        results[label] = {
+            "s": s,
+            "profile": profile,
+            "widths_px": np.array(widths_px, dtype=float),
+        }
+
+    return results, (cx, cy)
+
+
+def add_physical_units(results, pixel_size_um):
+    for key in results:
+        results[key]["widths_um"] = results[key]["widths_px"] * pixel_size_um
+    return results
+
+
+def print_width_table(thresholds, results, image_name="Image", unit="px"):
+    if unit == "px":
+        left = results["diag_left"]["widths_px"]
+        right = results["diag_right"]["widths_px"]
+        unit_label = "px"
+    else:
+        left = results["diag_left"]["widths_um"]
+        right = results["diag_right"]["widths_um"]
+        unit_label = "um"
+
+    print(f"\n{image_name} ({unit_label})")
+    print(f"{'Threshold [%]':>12} | {'Width diag_left':>18} | {'Width diag_right':>19}")
+    print("-" * 60)
+    for t, w1, w2 in zip(thresholds, left, right):
+        print(f"{100*t:12.0f} | {w1:18.2f} | {w2:19.2f}")
+
+
+def print_magnification_table(thresholds, res1, res2, name1="Image 1", name2="Image 2"):
+    print(f"\nMagnification comparison: {name1} / {name2}")
+    print(f"{'Threshold [%]':>12} | {'Mag diag_left':>14} | {'Mag diag_right':>15}")
+    print("-" * 50)
+
+    for t, a1, a2, b1, b2 in zip(
+        thresholds,
+        res1["diag_left"]["widths_um"],
+        res1["diag_right"]["widths_um"],
+        res2["diag_left"]["widths_um"],
+        res2["diag_right"]["widths_um"],
+    ):
+        m1 = a1 / b1 if np.isfinite(a1) and np.isfinite(b1) and b1 != 0 else np.nan
+        m2 = a2 / b2 if np.isfinite(a2) and np.isfinite(b2) and b2 != 0 else np.nan
+        print(f"{100*t:12.0f} | {m1:14.3f} | {m2:15.3f}")
+
+
+def plot_widths(thresholds, res1, res2, name1="Image 1", name2="Image 2"):
+    plt.figure(figsize=(8, 5))
+    plt.plot(100 * thresholds, res1["diag_left"]["widths_um"], "o-", label=f"{name1} diag_left")
+    plt.plot(100 * thresholds, res1["diag_right"]["widths_um"], "o-", label=f"{name1} diag_right")
+    plt.plot(100 * thresholds, res2["diag_left"]["widths_um"], "s--", label=f"{name2} diag_left")
+    plt.plot(100 * thresholds, res2["diag_right"]["widths_um"], "s--", label=f"{name2} diag_right")
+
+    plt.xlabel("Threshold [% of maximum]")
+    plt.ylabel("Width along diagonal [µm]")
+    plt.title("Beam size along both diagonals")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_magnification(thresholds, res1, res2):
+    mag_left = res1["diag_left"]["widths_um"] / res2["diag_left"]["widths_um"]
+    mag_right = res1["diag_right"]["widths_um"] / res2["diag_right"]["widths_um"]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(100 * thresholds, mag_left, "o-", label="Magnification diag_left")
+    plt.plot(100 * thresholds, mag_right, "o-", label="Magnification diag_right")
+    plt.xlabel("Threshold [% of maximum]")
+    plt.ylabel("Magnification factor")
+    plt.title("Magnification factor along both diagonals")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    folder = r"C:\Users\User\Desktop\Vergroesserung"
+
+    path_original = os.path.join(folder, "original groesse.tiff")
+    path_phasics = os.path.join(folder, "Vorne phasics_bg_subtracted.tiff")
+
+    # pixel sizes in micrometers per pixel
+    pixel_size_original_um = 11
+    pixel_size_phasics_um = 24.0
+
+    img_original = load_image(path_original)
+    img_phasics = load_image(path_phasics)
+
+    thresholds = np.arange(0.05, 1.00, 0.05)  # 5% to 95%
+
+    res_original, center_original = compute_diagonal_widths(img_original, thresholds)
+    res_phasics, center_phasics = compute_diagonal_widths(img_phasics, thresholds)
+
+    res_original = add_physical_units(res_original, pixel_size_original_um)
+    res_phasics = add_physical_units(res_phasics, pixel_size_phasics_um)
+
+    print(f"Center original image: x={center_original[0]:.2f}, y={center_original[1]:.2f}")
+    print(f"Center Phasics image:  x={center_phasics[0]:.2f}, y={center_phasics[1]:.2f}")
+
+    print_width_table(thresholds, res_original, image_name="original groesse", unit="px")
+    print_width_table(thresholds, res_original, image_name="original groesse", unit="um")
+
+    print_width_table(thresholds, res_phasics, image_name="Vorne phasics_bg_subtracted", unit="px")
+    print_width_table(thresholds, res_phasics, image_name="Vorne phasics_bg_subtracted", unit="um")
+
+    print_magnification_table(
+        thresholds,
+        res_original,
+        res_phasics,
+        name1="no telescope beam size",
+        name2="with telescope (phasics)",
+    )
+
+    plot_widths(
+        thresholds,
+        res_original,
+        res_phasics,
+        name1="original beam size",
+        name2="with telescope (phasics)",
+    )
+
+    plot_magnification(thresholds, res_original, res_phasics)

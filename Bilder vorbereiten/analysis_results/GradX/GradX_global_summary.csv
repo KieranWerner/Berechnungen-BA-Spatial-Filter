@@ -1,0 +1,2 @@
+n_images,height_px,width_px,global_mean,global_std,global_median,global_min,global_max
+200,400,400,3.159147499999841e-05,11.039225269823353,0.0,-99.3588,96.9423

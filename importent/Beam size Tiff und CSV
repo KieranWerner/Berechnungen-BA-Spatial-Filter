@@ -1,0 +1,439 @@
+from pathlib import Path
+import json
+import csv
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from PIL import Image
+
+
+# ============================================================
+# EINSTELLUNGEN
+# ============================================================
+INPUT_FILE = Path(r"C:\Users\User\Desktop\Beam size\average_INT aus TIFF.tiff")
+OUTPUT_DIR = INPUT_FILE.parent / "beam_size_results"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Physikalische Pixelgröße in µm
+# None -> Ausgabe in Pixeln
+PIXEL_SIZE_UM = 24
+
+# Nur Signal über threshold_rel * max(I) verwenden
+THRESHOLD_REL = 0.02
+
+# Optionale Kreisapertur
+USE_CIRCLE_MASK = False
+CIRCLE_RADIUS_PX = 180
+CIRCLE_CENTER_X = None
+CIRCLE_CENTER_Y = None
+
+# Optionaler Hintergrundabzug
+SUBTRACT_BACKGROUND = False
+BACKGROUND_PERCENTILE = 5.0
+
+
+# ============================================================
+# DATEI EINLESEN
+# ============================================================
+def load_csv_auto(path: Path) -> np.ndarray:
+    for delim in [",", ";", "\t"]:
+        try:
+            arr = np.loadtxt(path, delimiter=delim)
+            if arr.ndim == 2 and arr.size > 0:
+                return np.asarray(arr, dtype=np.float64)
+        except Exception:
+            pass
+    raise ValueError(f"CSV-Datei konnte nicht gelesen werden: {path}")
+
+
+def load_tiff(path: Path) -> np.ndarray:
+    img = Image.open(path)
+    arr = np.array(img, dtype=np.float64)
+
+    # Falls mehrere Kanäle vorhanden sind, Mittelwert bilden
+    if arr.ndim == 3:
+        arr = arr.mean(axis=2)
+
+    if arr.ndim != 2:
+        raise ValueError(f"TIFF muss 2D sein, bekommen: shape={arr.shape}")
+
+    return arr
+
+
+def load_input(path: Path) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        return load_csv_auto(path)
+
+    if suffix in [".tif", ".tiff"]:
+        return load_tiff(path)
+
+    raise ValueError(
+        f"Nicht unterstütztes Format: {suffix}. Erlaubt sind .csv, .tif, .tiff"
+    )
+
+
+# ============================================================
+# VORVERARBEITUNG
+# ============================================================
+def preprocess_intensity(intensity: np.ndarray,
+                         subtract_background: bool = False,
+                         background_percentile: float = 5.0) -> np.ndarray:
+    I = np.array(intensity, dtype=float, copy=True)
+    I[~np.isfinite(I)] = 0.0
+
+    if subtract_background:
+        bg = np.percentile(I, background_percentile)
+        I = I - bg
+        I[I < 0] = 0.0
+
+    return I
+
+
+def make_valid_mask(intensity, threshold_rel=0.02, use_circle=False,
+                    circle_radius_px=180, cx=None, cy=None):
+    intensity = np.asarray(intensity, dtype=float)
+
+    peak = np.nanmax(intensity)
+    if not np.isfinite(peak) or peak <= 0:
+        raise ValueError("Ungültige Intensitätsdaten: Maximum <= 0")
+
+    thr = threshold_rel * peak
+    valid = np.isfinite(intensity) & (intensity > thr)
+
+    ny, nx = intensity.shape
+    Y, X = np.indices((ny, nx))
+
+    if cx is None:
+        cx = (nx - 1) / 2.0
+    if cy is None:
+        cy = (ny - 1) / 2.0
+
+    if use_circle:
+        circle = (X - cx) ** 2 + (Y - cy) ** 2 <= circle_radius_px ** 2
+        valid &= circle
+
+    if not np.any(valid):
+        raise ValueError("Maske ist leer. THRESHOLD_REL oder Kreisapertur prüfen.")
+
+    return valid, float(thr), float(cx), float(cy)
+
+
+# ============================================================
+# HILFSFUNKTIONEN FÜR BEAM-METRIKEN
+# ============================================================
+def _centroid_pixels(I):
+    I = np.clip(np.asarray(I, float), 0, None)
+    P = I.sum()
+    if P <= 0:
+        raise ValueError("Gesamtintensität ist 0.")
+
+    y = np.arange(I.shape[0])
+    x = np.arange(I.shape[1])
+    X, Y = np.meshgrid(x, y)
+
+    x0 = float((I * X).sum() / P)
+    y0 = float((I * Y).sum() / P)
+    return x0, y0, P, X, Y
+
+
+def _encircled_energy_radius(I, R, frac, P):
+    order = np.argsort(R.ravel())
+    r_sorted = R.ravel()[order]
+    i_sorted = I.ravel()[order]
+    cdf = np.cumsum(i_sorted) / P
+    idx = min(np.searchsorted(cdf, frac), len(r_sorted) - 1)
+    return float(r_sorted[idx])
+
+
+def _area_equivalent_diameter(I, dx, dy, rel_threshold):
+    peak = float(np.max(I))
+    if peak <= 0:
+        return np.nan
+
+    mask = I >= (rel_threshold * peak)
+    area = float(mask.sum()) * dx * dy
+    if area <= 0:
+        return np.nan
+
+    return float(np.sqrt(4.0 * area / np.pi))
+
+
+def _fwhm_1d(axis_coords, profile):
+    profile = np.asarray(profile, dtype=float)
+
+    if profile.size < 2:
+        return np.nan
+
+    peak = float(np.max(profile))
+    if peak <= 0:
+        return np.nan
+
+    half = 0.5 * peak
+    idx = np.where(profile >= half)[0]
+    if idx.size < 2:
+        return np.nan
+
+    i_left = int(idx[0])
+    i_right = int(idx[-1])
+
+    if i_left > 0:
+        x1, x2 = axis_coords[i_left - 1], axis_coords[i_left]
+        y1, y2 = profile[i_left - 1], profile[i_left]
+        if y2 != y1:
+            left = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            left = axis_coords[i_left]
+    else:
+        left = axis_coords[i_left]
+
+    if i_right < profile.size - 1:
+        x1, x2 = axis_coords[i_right], axis_coords[i_right + 1]
+        y1, y2 = profile[i_right], profile[i_right + 1]
+        if y2 != y1:
+            right = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            right = axis_coords[i_right]
+    else:
+        right = axis_coords[i_right]
+
+    return float(right - left)
+
+
+# ============================================================
+# 6 BEAM-SIZE-DEFINITIONEN
+# ============================================================
+def beam_metrics(I, dx=1.0, dy=1.0):
+    I = np.clip(np.asarray(I, float), 0, None)
+    x0_px, y0_px, P, X, Y = _centroid_pixels(I)
+
+    Xc = (X - x0_px) * dx
+    Yc = (Y - y0_px) * dy
+    R = np.sqrt(Xc ** 2 + Yc ** 2)
+
+    sigma_x = float(np.sqrt((I * Xc ** 2).sum() / P))
+    sigma_y = float(np.sqrt((I * Yc ** 2).sum() / P))
+
+    d4sigma_x = 4.0 * sigma_x
+    d4sigma_y = 4.0 * sigma_y
+    d4sigma_avg = 0.5 * (d4sigma_x + d4sigma_y)
+
+    r50 = _encircled_energy_radius(I, R, 0.50, P)
+    r86 = _encircled_energy_radius(I, R, 0.86, P)
+    d_ee50 = 2.0 * r50
+    d_ee86 = 2.0 * r86
+
+    d_area_50pct = _area_equivalent_diameter(I, dx, dy, 0.50)
+    d_area_13p5pct = _area_equivalent_diameter(I, dx, dy, 0.135)
+
+    x_axis = np.arange(I.shape[1]) * dx
+    y_axis = np.arange(I.shape[0]) * dy
+
+    cx_i = int(round(x0_px))
+    cy_i = int(round(y0_px))
+    cx_i = np.clip(cx_i, 0, I.shape[1] - 1)
+    cy_i = np.clip(cy_i, 0, I.shape[0] - 1)
+
+    profile_x = I[cy_i, :]
+    profile_y = I[:, cx_i]
+
+    fwhm_x = _fwhm_1d(x_axis, profile_x)
+    fwhm_y = _fwhm_1d(y_axis, profile_y)
+    fwhm_avg = 0.5 * (fwhm_x + fwhm_y)
+
+    return {
+        "centroid_x": x0_px * dx,
+        "centroid_y": y0_px * dy,
+        "D4sigma_x": d4sigma_x,
+        "D4sigma_y": d4sigma_y,
+        "D4sigma_avg": d4sigma_avg,
+        "D_EE50": d_ee50,
+        "D_EE86": d_ee86,
+        "D_area_50pct": d_area_50pct,
+        "D_area_13p5pct": d_area_13p5pct,
+        "FWHM_x": fwhm_x,
+        "FWHM_y": fwhm_y,
+        "FWHM_avg": fwhm_avg,
+    }
+
+
+# ============================================================
+# AUSGABE
+# ============================================================
+def convert_metrics_for_output(metrics, pixel_size_um):
+    if pixel_size_um is None:
+        values = {k: float(v) for k, v in metrics.items()}
+        units = {k: "px" for k in metrics.keys()}
+        return values, units
+
+    # Wenn dx,dy in µm gerechnet wurden, dann hier nur noch µm -> mm
+    values = {}
+    units = {}
+    for k, v in metrics.items():
+        values[k] = float(v) * 1e-3
+        units[k] = "mm"
+    return values, units
+
+
+def save_results_csv(path, values, units):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value", "unit"])
+        for key in values:
+            writer.writerow([key, values[key], units[key]])
+
+
+def save_results_json(path, meta):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+def save_plots(I_raw, I_masked, valid_mask, output_dir, pixel_size_um=None):
+    x0_px, y0_px, _, _, _ = _centroid_pixels(I_masked)
+    cx_i = int(round(x0_px))
+    cy_i = int(round(y0_px))
+    cx_i = np.clip(cx_i, 0, I_masked.shape[1] - 1)
+    cy_i = np.clip(cy_i, 0, I_masked.shape[0] - 1)
+
+    profile_x = I_masked[cy_i, :]
+    profile_y = I_masked[:, cx_i]
+
+    if pixel_size_um is None:
+        x_axis = np.arange(I_masked.shape[1])
+        y_axis = np.arange(I_masked.shape[0])
+        axis_label = "Pixel"
+    else:
+        x_axis = np.arange(I_masked.shape[1]) * pixel_size_um * 1e-3
+        y_axis = np.arange(I_masked.shape[0]) * pixel_size_um * 1e-3
+        axis_label = "Position [mm]"
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(I_raw, origin="lower")
+    plt.colorbar(label="Intensity")
+    plt.title("Original intensity")
+    plt.tight_layout()
+    plt.savefig(output_dir / "intensity_raw.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(valid_mask.astype(float), origin="lower")
+    plt.colorbar(label="Valid mask")
+    plt.title("Valid mask")
+    plt.tight_layout()
+    plt.savefig(output_dir / "valid_mask.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(I_masked, origin="lower")
+    plt.colorbar(label="Intensity")
+    plt.title("Masked intensity")
+    plt.tight_layout()
+    plt.savefig(output_dir / "intensity_masked.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x_axis, profile_x, label="Horizontal profile")
+    plt.plot(y_axis, profile_y, label="Vertical profile")
+    plt.xlabel(axis_label)
+    plt.ylabel("Intensity")
+    plt.title("Profiles through centroid")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "profiles_through_centroid.png", dpi=180)
+    plt.close()
+
+
+# ============================================================
+# HAUPTPROGRAMM
+# ============================================================
+def main():
+    intensity_raw = load_input(INPUT_FILE)
+
+    intensity = preprocess_intensity(
+        intensity_raw,
+        subtract_background=SUBTRACT_BACKGROUND,
+        background_percentile=BACKGROUND_PERCENTILE,
+    )
+
+    valid_mask, threshold_abs, cx, cy = make_valid_mask(
+        intensity=intensity,
+        threshold_rel=THRESHOLD_REL,
+        use_circle=USE_CIRCLE_MASK,
+        circle_radius_px=CIRCLE_RADIUS_PX,
+        cx=CIRCLE_CENTER_X,
+        cy=CIRCLE_CENTER_Y,
+    )
+
+    I_masked = np.zeros_like(intensity, dtype=float)
+    I_masked[valid_mask] = intensity[valid_mask]
+
+    if PIXEL_SIZE_UM is None:
+        dx = 1.0
+        dy = 1.0
+    else:
+        dx = PIXEL_SIZE_UM      # intern in µm rechnen
+        dy = PIXEL_SIZE_UM
+
+    metrics = beam_metrics(I_masked, dx=dx, dy=dy)
+    values, units = convert_metrics_for_output(metrics, PIXEL_SIZE_UM)
+
+    save_results_csv(OUTPUT_DIR / "beam_size_6_definitions.csv", values, units)
+
+    meta = {
+        "input_file": str(INPUT_FILE),
+        "image_shape": list(intensity.shape),
+        "pixel_size_um": PIXEL_SIZE_UM,
+        "threshold_rel": THRESHOLD_REL,
+        "threshold_abs": threshold_abs,
+        "use_circle_mask": USE_CIRCLE_MASK,
+        "circle_radius_px": CIRCLE_RADIUS_PX,
+        "circle_center_x_px": cx,
+        "circle_center_y_px": cy,
+        "subtract_background": SUBTRACT_BACKGROUND,
+        "background_percentile": BACKGROUND_PERCENTILE,
+        "results": {
+            key: {
+                "value": values[key],
+                "unit": units[key]
+            } for key in values
+        }
+    }
+    save_results_json(OUTPUT_DIR / "beam_size_6_definitions.json", meta)
+
+    save_plots(
+        I_raw=intensity_raw,
+        I_masked=I_masked,
+        valid_mask=valid_mask,
+        output_dir=OUTPUT_DIR,
+        pixel_size_um=PIXEL_SIZE_UM,
+    )
+
+    print("Fertig.")
+    print(f"Datei: {INPUT_FILE}")
+    print(f"Array-Form: {intensity.shape}")
+    print(f"Valid pixels: {int(valid_mask.sum())}")
+    print()
+
+    if PIXEL_SIZE_UM is None:
+        print("Beamgrößen in Pixel:")
+    else:
+        print("Beamgrößen in mm:")
+
+    for key in values:
+        print(f"{key:16s} = {values[key]:.6f} {units[key]}")
+
+    print()
+    print(f"Ergebnisse gespeichert in: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

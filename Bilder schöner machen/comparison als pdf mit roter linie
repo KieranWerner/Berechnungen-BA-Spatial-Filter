@@ -1,0 +1,50 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+# Eingabedatei
+input_path = r"C:\Users\User\Desktop\extended_parameter_optimization\int_corrected\best_values_per_combination_sorted.csv"
+
+# Ausgabeordner auf dem Desktop
+desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+output_folder = os.path.join(desktop, "ExtraDesktopOrdner")
+os.makedirs(output_folder, exist_ok=True)
+
+# Ausgabedatei
+output_path = os.path.join(output_folder, "best_parameter_ranking_combi.pdf")
+
+# CSV laden
+df = pd.read_csv(input_path)
+
+# Richtige Spalten aus der CSV wählen
+categories = df["scenario"].astype(str)
+values = pd.to_numeric(df["mae_mm"], errors="coerce")
+
+# Nur gültige Zeilen behalten
+plot_df = pd.DataFrame({
+    "category": categories,
+    "value": values
+}).dropna()
+
+# Optional sortieren
+plot_df = plot_df.sort_values("value", ascending=True)
+
+# Plot
+plt.figure(figsize=(14, 7), dpi=150)
+plt.bar(plot_df["category"], plot_df["value"])
+
+# Rote gestrichelte Linie
+plt.axhline(y=0.550034, color="red", linestyle="--", linewidth=2)
+
+# Titel und Achsen
+plt.title("Best single value per parameter ranked by mae_mm | int_corrected", fontsize=18)
+plt.ylabel("mae_mm [mm]", fontsize=16)
+plt.xticks(rotation=45, ha="right", fontsize=10)
+plt.yticks(fontsize=12)
+
+plt.tight_layout()
+plt.savefig(output_path, format="pdf", bbox_inches="tight")
+plt.close()
+
+print("PDF gespeichert unter:")
+print(output_path)

@@ -1,0 +1,470 @@
+from pathlib import Path
+import csv
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --------------------------------------------------
+# MANUELLE DATEIEN (HIER ÄNDERN)
+# Nur 2 Dateien: corrected vs. not corrected
+# --------------------------------------------------
+FILE_PAIRS = [
+    (
+        Path(r"C:\Users\User\Desktop\combined INT front csv\average_INT no bg substract.csv"),
+        Path(r"C:\Users\User\Desktop\combined PHA front csv\average_PHA no bg substract.csv"),
+        "corrected"
+    ),
+    (
+        Path(r"C:\Users\User\Desktop\combined INT front csv\average_INT front bg substracted.csv"),
+        Path(r"C:\Users\User\Desktop\combined PHA front csv\average_PHA no bg substract.csv"),
+        "not_corrected"
+    ),
+]
+
+OUTPUT_DIR = Path(r"C:\Users\User\Desktop\Theory free propagation_manual")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+INPUT_D4SIGMA_MM = 13.7
+WAVELENGTH_M = 800e-9
+PHASE_SIGN = -1.0
+Z_LIST = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 8.1, 10.0, 12.0, 13.0, 13.50]
+
+# 2D-Vergleich genau bei diesem Abstand
+COMPARE_Z = 13.0
+
+INTENSITY_THRESHOLD_REL = 0.02
+USE_CIRCLE_MASK = True
+CIRCLE_RADIUS_PX = 180
+
+
+# --------------------------------------------------
+# FUNKTIONEN
+# --------------------------------------------------
+def load_csv_auto(path):
+    for delim in [",", ";", "\t"]:
+        try:
+            arr = np.loadtxt(path, delimiter=delim)
+            if arr.ndim == 2 and arr.size > 0:
+                return arr.astype(float)
+        except Exception:
+            pass
+    raise ValueError(f"Could not parse {path}")
+
+
+def angular_spectrum(U0, dx, dy, wavelength, z, pad_factor=4):
+    ny, nx = U0.shape
+
+    py = int((pad_factor - 1) * ny / 2)
+    px = int((pad_factor - 1) * nx / 2)
+
+    U = np.pad(U0, ((py, py), (px, px)), mode="constant")
+    Ny, Nx = U.shape
+
+    fx = np.fft.fftfreq(Nx, d=dx)
+    fy = np.fft.fftfreq(Ny, d=dy)
+    FX, FY = np.meshgrid(fx, fy)
+
+    k = 2 * np.pi / wavelength
+    kx = 2 * np.pi * FX
+    ky = 2 * np.pi * FY
+
+    kz_sq = k**2 - kx**2 - ky**2
+    kz = np.sqrt(np.maximum(kz_sq, 0.0))
+
+    H = np.exp(1j * kz * z)
+    H[kz_sq < 0] = 0.0
+
+    Uz = np.fft.ifft2(np.fft.fft2(U) * H)
+    return Uz[py:py + ny, px:px + nx]
+
+
+def make_valid_mask(intensity):
+    thr = INTENSITY_THRESHOLD_REL * np.nanmax(intensity)
+    valid = np.isfinite(intensity) & (intensity > thr)
+
+    ny, nx = intensity.shape
+    Y, X = np.indices((ny, nx))
+    cx = (nx - 1) / 2.0
+    cy = (ny - 1) / 2.0
+
+    if USE_CIRCLE_MASK:
+        circle = (X - cx)**2 + (Y - cy)**2 <= CIRCLE_RADIUS_PX**2
+        valid = valid & circle
+
+    return valid
+
+
+def build_field(intensity, phase, mask):
+    norm = np.zeros_like(intensity, dtype=float)
+    norm[mask] = intensity[mask] / np.max(intensity[mask])
+
+    A = np.zeros_like(intensity, dtype=float)
+    A[mask] = np.sqrt(norm[mask])
+
+    phase_clean = np.zeros_like(phase, dtype=float)
+    phase_clean[mask] = phase[mask]
+
+    phi = PHASE_SIGN * 2 * np.pi * phase_clean
+    return A * np.exp(1j * phi)
+
+
+def _centroid_pixels(I):
+    I = np.clip(np.asarray(I, dtype=float), 0, None)
+    P = I.sum()
+    if P <= 0:
+        raise ValueError("Intensity sum is zero.")
+
+    y = np.arange(I.shape[0])
+    x = np.arange(I.shape[1])
+    X, Y = np.meshgrid(x, y)
+
+    x0 = float((I * X).sum() / P)
+    y0 = float((I * Y).sum() / P)
+    return x0, y0, P, X, Y
+
+
+def _encircled_energy_radius(I, R, frac, P):
+    order = np.argsort(R.ravel())
+    r_sorted = R.ravel()[order]
+    i_sorted = I.ravel()[order]
+    cdf = np.cumsum(i_sorted) / P
+    idx = min(np.searchsorted(cdf, frac), len(r_sorted) - 1)
+    return float(r_sorted[idx])
+
+
+def _area_equivalent_diameter(I, dx, dy, rel_threshold):
+    peak = float(np.max(I))
+    if peak <= 0:
+        return np.nan
+
+    mask = I >= (rel_threshold * peak)
+    area_m2 = float(mask.sum()) * dx * dy
+    if area_m2 <= 0:
+        return np.nan
+
+    return float(np.sqrt(4.0 * area_m2 / np.pi))
+
+
+def _fwhm_1d(axis_coords, profile):
+    profile = np.asarray(profile, dtype=float)
+    if profile.size < 2:
+        return np.nan
+
+    peak = float(np.max(profile))
+    if peak <= 0:
+        return np.nan
+
+    half = 0.5 * peak
+    idx = np.where(profile >= half)[0]
+    if idx.size < 2:
+        return np.nan
+
+    i_left = int(idx[0])
+    i_right = int(idx[-1])
+
+    if i_left > 0:
+        x1, x2 = axis_coords[i_left - 1], axis_coords[i_left]
+        y1, y2 = profile[i_left - 1], profile[i_left]
+        if y2 != y1:
+            left = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            left = axis_coords[i_left]
+    else:
+        left = axis_coords[i_left]
+
+    if i_right < profile.size - 1:
+        x1, x2 = axis_coords[i_right], axis_coords[i_right + 1]
+        y1, y2 = profile[i_right], profile[i_right + 1]
+        if y2 != y1:
+            right = x1 + (half - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            right = axis_coords[i_right]
+    else:
+        right = axis_coords[i_right]
+
+    return float(right - left)
+
+
+def beam_metrics(I, dx, dy):
+    I = np.clip(np.asarray(I, dtype=float), 0, None)
+    x0_px, y0_px, P, X, Y = _centroid_pixels(I)
+
+    Xc = (X - x0_px) * dx
+    Yc = (Y - y0_px) * dy
+    R = np.sqrt(Xc**2 + Yc**2)
+
+    sigma_x = float(np.sqrt((I * Xc**2).sum() / P))
+    sigma_y = float(np.sqrt((I * Yc**2).sum() / P))
+
+    d4sigma_x = 4.0 * sigma_x
+    d4sigma_y = 4.0 * sigma_y
+    d4sigma_avg = 0.5 * (d4sigma_x + d4sigma_y)
+
+    r50 = _encircled_energy_radius(I, R, 0.50, P)
+    r86 = _encircled_energy_radius(I, R, 0.86, P)
+
+    d_ee50 = 2.0 * r50
+    d_ee86 = 2.0 * r86
+
+    d_area_50pct = _area_equivalent_diameter(I, dx, dy, 0.50)
+    d_area_13p5pct = _area_equivalent_diameter(I, dx, dy, 0.135)
+
+    x_axis = np.arange(I.shape[1]) * dx
+    y_axis = np.arange(I.shape[0]) * dy
+
+    cx_i = int(round(x0_px))
+    cy_i = int(round(y0_px))
+
+    cx_i = np.clip(cx_i, 0, I.shape[1] - 1)
+    cy_i = np.clip(cy_i, 0, I.shape[0] - 1)
+
+    profile_x = I[cy_i, :]
+    profile_y = I[:, cx_i]
+
+    fwhm_x = _fwhm_1d(x_axis, profile_x)
+    fwhm_y = _fwhm_1d(y_axis, profile_y)
+    fwhm_avg = 0.5 * (fwhm_x + fwhm_y)
+
+    return {
+        "D4sigma_mm": d4sigma_avg * 1e3,
+        "D_EE50_mm": d_ee50 * 1e3,
+        "D_EE86_mm": d_ee86 * 1e3,
+        "D_area_50pct_mm": d_area_50pct * 1e3,
+        "D_area_13p5pct_mm": d_area_13p5pct * 1e3,
+        "FWHM_mm": fwhm_avg * 1e3,
+    }
+
+
+# --------------------------------------------------
+# HAUPTLOOP
+# --------------------------------------------------
+all_rows = []
+profiles_at_compare_z = {}
+dx_map = {}
+
+for int_path, pha_path, label in FILE_PAIRS:
+    print(f"Verarbeite: {label}")
+
+    intensity = load_csv_auto(int_path)
+    phase = load_csv_auto(pha_path)
+
+    if intensity.shape != phase.shape:
+        raise ValueError(
+            f"Shape mismatch bei {label}: INT {intensity.shape} vs PHA {phase.shape}"
+        )
+
+    mask = make_valid_mask(intensity)
+
+    tmp = np.zeros_like(intensity, dtype=float)
+    tmp[mask] = intensity[mask]
+
+    scale_metrics = beam_metrics(tmp, 1.0, 1.0)
+    scale = scale_metrics["D4sigma_mm"] / 1e3
+
+    dx = (INPUT_D4SIGMA_MM / scale) * 1e-3
+    dy = dx
+    dx_map[label] = dx
+
+    U0 = build_field(intensity, phase, mask)
+
+    rows = []
+
+    for z in Z_LIST:
+        Uz = U0 if z == 0 else angular_spectrum(U0, dx, dy, WAVELENGTH_M, z)
+        Iz = np.abs(Uz) ** 2
+
+        metrics = beam_metrics(Iz, dx, dy)
+
+        row = {
+            "label": label,
+            "z": z,
+            **metrics
+        }
+        rows.append(row)
+
+        if np.isclose(z, COMPARE_Z):
+            profiles_at_compare_z[label] = Iz.copy()
+
+    all_rows.extend(rows)
+
+    single_csv = OUTPUT_DIR / f"{label.replace(' ', '_')}_beam_size_vs_z.csv"
+    with open(single_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+# --------------------------------------------------
+# GESAMT-DATEN SPEICHERN
+# --------------------------------------------------
+combined_csv = OUTPUT_DIR / "all_beam_size_vs_z.csv"
+with open(combined_csv, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(all_rows)
+
+with open(OUTPUT_DIR / "all_beam_size_vs_z.json", "w", encoding="utf-8") as f:
+    json.dump(all_rows, f, indent=2)
+
+# --------------------------------------------------
+# PLOT: ALLE SIZE-DEFINITIONEN
+# --------------------------------------------------
+plt.figure(figsize=(14, 9))
+
+metric_styles = [
+    ("D4sigma_mm", "o", "-"),
+    ("D_EE50_mm", "s", "-"),
+    ("D_EE86_mm", "^", "-"),
+    ("D_area_50pct_mm", "d", "--"),
+    ("D_area_13p5pct_mm", "v", "--"),
+    ("FWHM_mm", "P", "-."),
+]
+
+labels = list(dict.fromkeys(r["label"] for r in all_rows))
+
+for label in labels:
+    data = [r for r in all_rows if r["label"] == label]
+    z = [r["z"] for r in data]
+
+    for metric_name, marker, linestyle in metric_styles:
+        values = [r[metric_name] for r in data]
+        plot_label = f"{label} - {metric_name.replace('_mm', '')}"
+        plt.plot(z, values, marker=marker, linestyle=linestyle, label=plot_label)
+
+plt.xlabel("z [m]")
+plt.ylabel("Beam size [mm]")
+plt.title("Propagation (WITH phase) - all size definitions")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8, ncol=2)
+plt.tight_layout()
+
+plt.savefig(OUTPUT_DIR / "result_all_definitions.png", dpi=180)
+plt.savefig(OUTPUT_DIR / "result_all_definitions.pdf")
+plt.close()
+
+# --------------------------------------------------
+# 2D-VERGLEICH BEI 13 m
+# --------------------------------------------------
+if len(FILE_PAIRS) != 2:
+    print("2D-Differenzbild wird nur erstellt, wenn genau 2 Dateien verglichen werden.")
+else:
+    label1 = FILE_PAIRS[0][2]
+    label2 = FILE_PAIRS[1][2]
+
+    if label1 not in profiles_at_compare_z or label2 not in profiles_at_compare_z:
+        print(f"Kein gespeichertes Profil für z = {COMPARE_Z} m gefunden.")
+    else:
+        I1 = profiles_at_compare_z[label1]
+        I2 = profiles_at_compare_z[label2]
+
+        # optional normieren, damit Form statt absoluter Leistung verglichen wird
+        I1_norm = I1 / np.max(I1) if np.max(I1) > 0 else I1
+        I2_norm = I2 / np.max(I2) if np.max(I2) > 0 else I2
+
+        diff_abs = I1_norm - I2_norm
+
+        denom = np.maximum(I2_norm, 1e-12)
+        diff_rel = (I1_norm - I2_norm) / denom
+
+        dx = dx_map[label1]
+        ny, nx = I1.shape
+        x_mm = (np.arange(nx) - (nx - 1) / 2.0) * dx * 1e3
+        y_mm = (np.arange(ny) - (ny - 1) / 2.0) * dx * 1e3
+        extent = [x_mm[0], x_mm[-1], y_mm[0], y_mm[-1]]
+
+        # 4er-Panel
+        fig, ax = plt.subplots(2, 2, figsize=(12, 10))
+
+        im0 = ax[0, 0].imshow(I1_norm, origin="lower", extent=extent)
+        ax[0, 0].set_title(f"{label1} @ z={COMPARE_Z} m")
+        ax[0, 0].set_xlabel("x [mm]")
+        ax[0, 0].set_ylabel("y [mm]")
+        plt.colorbar(im0, ax=ax[0, 0], fraction=0.046, pad=0.04)
+
+        im1 = ax[0, 1].imshow(I2_norm, origin="lower", extent=extent)
+        ax[0, 1].set_title(f"{label2} @ z={COMPARE_Z} m")
+        ax[0, 1].set_xlabel("x [mm]")
+        ax[0, 1].set_ylabel("y [mm]")
+        plt.colorbar(im1, ax=ax[0, 1], fraction=0.046, pad=0.04)
+
+        vmax_abs = np.max(np.abs(diff_abs))
+        im2 = ax[1, 0].imshow(
+            diff_abs,
+            origin="lower",
+            extent=extent,
+            vmin=-vmax_abs,
+            vmax=vmax_abs
+        )
+        ax[1, 0].set_title(f"Absolute difference (normalized)\n{label1} - {label2}")
+        ax[1, 0].set_xlabel("x [mm]")
+        ax[1, 0].set_ylabel("y [mm]")
+        plt.colorbar(im2, ax=ax[1, 0], fraction=0.046, pad=0.04)
+
+        vmax_rel = np.nanpercentile(np.abs(diff_rel), 99)
+        im3 = ax[1, 1].imshow(
+            diff_rel,
+            origin="lower",
+            extent=extent,
+            vmin=-vmax_rel,
+            vmax=vmax_rel
+        )
+        ax[1, 1].set_title(f"Relative difference\n({label1} - {label2}) / {label2}")
+        ax[1, 1].set_xlabel("x [mm]")
+        ax[1, 1].set_ylabel("y [mm]")
+        plt.colorbar(im3, ax=ax[1, 1], fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"2D_comparison_at_{COMPARE_Z:.1f}m.png", dpi=180)
+        plt.savefig(OUTPUT_DIR / f"2D_comparison_at_{COMPARE_Z:.1f}m.pdf")
+        plt.close()
+
+        # zusätzlich CSV/NPY speichern
+        np.save(OUTPUT_DIR / f"{label1}_profile_{COMPARE_Z:.1f}m.npy", I1_norm)
+        np.save(OUTPUT_DIR / f"{label2}_profile_{COMPARE_Z:.1f}m.npy", I2_norm)
+        np.save(OUTPUT_DIR / f"diff_abs_{COMPARE_Z:.1f}m.npy", diff_abs)
+        np.save(OUTPUT_DIR / f"diff_rel_{COMPARE_Z:.1f}m.npy", diff_rel)
+
+        # zentrale Schnitte zusätzlich plotten
+        cy = I1.shape[0] // 2
+        cx = I1.shape[1] // 2
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(x_mm, I1_norm[cy, :], label=f"{label1} horizontal")
+        plt.plot(x_mm, I2_norm[cy, :], label=f"{label2} horizontal")
+        plt.plot(x_mm, diff_abs[cy, :], linestyle="--", label="difference horizontal")
+        plt.xlabel("x [mm]")
+        plt.ylabel("normalized intensity / difference")
+        plt.title(f"Central horizontal profile at z={COMPARE_Z} m")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / f"central_horizontal_profile_{COMPARE_Z:.1f}m.png", dpi=180)
+        plt.savefig(OUTPUT_DIR / f"central_horizontal_profile_{COMPARE_Z:.1f}m.pdf")
+        plt.close()
+
+# --------------------------------------------------
+# METADATEN
+# --------------------------------------------------
+meta = {
+    "file_pairs": [
+        {
+            "intensity_file": str(int_path),
+            "phase_file": str(pha_path),
+            "label": label
+        }
+        for int_path, pha_path, label in FILE_PAIRS
+    ],
+    "output_dir": str(OUTPUT_DIR),
+    "input_d4sigma_mm": INPUT_D4SIGMA_MM,
+    "wavelength_nm": WAVELENGTH_M * 1e9,
+    "phase_sign": PHASE_SIGN,
+    "z_list_m": Z_LIST,
+    "compare_z_m": COMPARE_Z,
+    "intensity_threshold_rel": INTENSITY_THRESHOLD_REL,
+    "use_circle_mask": USE_CIRCLE_MASK,
+    "circle_radius_px": CIRCLE_RADIUS_PX,
+}
+
+with open(OUTPUT_DIR / "run_metadata.json", "w", encoding="utf-8") as f:
+    json.dump(meta, f, indent=2)
+
+print("Done.")

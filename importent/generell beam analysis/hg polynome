@@ -1,0 +1,202 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from math import factorial, pi
+
+
+# =========================
+# FILE PATHS (DEINE DATEN)
+# =========================
+intensity_csv = r"C:\Users\User\Desktop\combined INT front csv\average_INT no bg substract.csv"
+phase_csv     = r"C:\Users\User\Desktop\combined PHA front csv\average_PHA no bg substract.csv"
+
+
+# =========================
+# SETTINGS
+# =========================
+nmax = 6
+intensity_threshold = 0.02
+
+
+# =========================
+# LOAD DATA
+# =========================
+I = pd.read_csv(intensity_csv, header=None).values.astype(float)
+P = pd.read_csv(phase_csv, header=None).values.astype(float)
+
+I = np.clip(I, 0, None)
+A = np.sqrt(I)
+
+U = A * np.exp(1j * P)
+
+
+# =========================
+# MASK + CENTROID
+# =========================
+mask = I > (intensity_threshold * I.max())
+
+yy, xx = np.indices(I.shape)
+
+w = I * mask
+x0 = (xx * w).sum() / w.sum()
+y0 = (yy * w).sum() / w.sum()
+
+x = xx - x0
+y = yy - y0
+
+
+# =========================
+# SECOND MOMENT → w0
+# =========================
+sigma_x = np.sqrt(((x**2) * w).sum() / w.sum())
+sigma_y = np.sqrt(((y**2) * w).sum() / w.sum())
+w0_est = 2 * np.sqrt(sigma_x * sigma_y)
+
+
+# =========================
+# REMOVE GLOBAL PHASE
+# =========================
+piston = np.angle(np.exp(1j * P[mask]).mean())
+U = U * np.exp(-1j * piston)
+
+
+# =========================
+# HERMITE POLYNOMIAL
+# =========================
+def hermite(n, z):
+    if n == 0:
+        return np.ones_like(z)
+    if n == 1:
+        return 2*z
+    H0 = np.ones_like(z)
+    H1 = 2*z
+    for k in range(2, n+1):
+        H2 = 2*z*H1 - 2*(k-1)*H0
+        H0, H1 = H1, H2
+    return H1
+
+
+# =========================
+# HG MODE
+# =========================
+def hg(n, m, x, y, w0):
+    xi = np.sqrt(2)*x/w0
+    yi = np.sqrt(2)*y/w0
+
+    return (
+        hermite(n, xi)
+        * hermite(m, yi)
+        * np.exp(-(x**2 + y**2)/w0**2)
+    )
+
+
+# =========================
+# BEST w0 FINDEN
+# =========================
+candidate_w0 = np.linspace(0.7*w0_est, 1.3*w0_est, 30)
+
+best_w0 = None
+best_overlap = -1
+
+u_mask = U[mask]
+
+for w0 in candidate_w0:
+    g = hg(0,0,x,y,w0)[mask]
+    overlap = (np.abs(np.vdot(g,u_mask))**2) / (
+        np.vdot(g,g).real * np.vdot(u_mask,u_mask).real
+    )
+    if overlap > best_overlap:
+        best_overlap = overlap
+        best_w0 = w0
+
+
+# =========================
+# HG BASIS
+# =========================
+modes = []
+labels = []
+
+for n in range(nmax+1):
+    for m in range(nmax+1-n):
+        mode = hg(n,m,x,y,best_w0)
+        norm = np.sqrt(np.vdot(mode[mask], mode[mask]).real)
+        mode = mode / norm
+        modes.append(mode)
+        labels.append((n,m))
+
+B = np.column_stack([m[mask].ravel() for m in modes])
+
+
+# =========================
+# FIT
+# =========================
+coeffs, *_ = np.linalg.lstsq(B, u_mask.ravel(), rcond=None)
+
+
+# =========================
+# RECONSTRUCTION
+# =========================
+U_rec = np.zeros_like(U, dtype=complex)
+for c, m in zip(coeffs, modes):
+    U_rec += c*m
+
+I_rec = np.abs(U_rec)**2
+
+
+# =========================
+# METRICS
+# =========================
+power_total = np.vdot(U[mask], U[mask]).real
+power_rec = np.vdot(U_rec[mask], U_rec[mask]).real
+
+overlap = (np.abs(np.vdot(U_rec[mask], U[mask]))**2) / (power_rec * power_total)
+
+error = np.sqrt(np.sum(((I_rec-I)*mask)**2) / np.sum((I*mask)**2))
+
+
+# =========================
+# MODE POWER
+# =========================
+power = np.abs(coeffs)**2
+power /= power.sum()
+
+data = []
+for (n,m), p in zip(labels, power):
+    data.append((n,m,n+m,p))
+
+df = pd.DataFrame(data, columns=["n","m","order","power"])
+
+df = df.sort_values("power", ascending=False)
+
+
+# =========================
+# PRINT
+# =========================
+print("\n=== HG Decomposition ===\n")
+print(f"w0 = {best_w0:.2f} px")
+print(f"HG00 overlap = {best_overlap*100:.2f} %")
+print(f"Full overlap = {overlap*100:.2f} %")
+print(f"Intensity error = {error*100:.2f} %\n")
+
+print(df.head(10))
+
+
+# =========================
+# PLOTS
+# =========================
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.imshow(I)
+plt.title("Original")
+
+plt.subplot(1,3,2)
+plt.imshow(I_rec)
+plt.title("Reconstruction")
+
+plt.subplot(1,3,3)
+plt.imshow((I_rec-I)*mask, cmap="RdBu")
+plt.title("Residual")
+
+plt.tight_layout()
+plt.show()

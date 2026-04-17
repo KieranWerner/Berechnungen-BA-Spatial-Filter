@@ -1,0 +1,405 @@
+from pathlib import Path
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+INPUT_DIR = Path(r"C:\Users\User\Desktop\Eingabe")
+OUTPUT_DIR = INPUT_DIR
+
+CROP_BORDER = 0              # e.g. 20 if you want to crop the outer border
+ZSCORE_THRESHOLD = 4.5       # threshold for automatic artifact detection
+MEDIAN_WINDOW = 2            # window=2 -> 5x5 neighborhood
+FIG_DPI = 300
+FIGSIZE = (6.5, 5.8)
+
+
+# ============================================================
+# READ SID4 .int FILE
+# ============================================================
+def read_sid4_int(file_path: Path) -> np.ndarray:
+    with open(file_path, "r", encoding="latin1") as f:
+        lines = f.readlines()
+
+    grd_index = None
+    height = None
+    width = None
+
+    for i, line in enumerate(lines):
+        if line.startswith("GRD"):
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                raise ValueError(f"Invalid GRD line in file: {file_path}")
+            height = int(parts[1])
+            width = int(parts[2])
+            grd_index = i
+            break
+
+    if grd_index is None:
+        raise ValueError(f"No GRD line found in file: {file_path}")
+
+    values = []
+    for line in lines[grd_index + 1:]:
+        line = line.strip()
+        if not line:
+            continue
+        for item in line.split("\t"):
+            if item != "":
+                values.append(int(item))
+
+    arr = np.array(values, dtype=np.float64)
+
+    expected_size = height * width
+    if arr.size != expected_size:
+        raise ValueError(
+            f"{file_path.name}: expected {expected_size} values, found {arr.size}"
+        )
+
+    return arr.reshape((height, width))
+
+
+# ============================================================
+# FILE MATCHING
+# ============================================================
+def normalize_base_name(file_path: Path) -> str:
+    name = file_path.stem
+    name = re.sub(r"[_\-\s]*GradX$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[_\-\s]*GradY$", "", name, flags=re.IGNORECASE)
+    return name.strip().lower()
+
+
+def collect_pairs(input_dir: Path):
+    gradx_files = sorted(input_dir.glob("*GradX.int"))
+    grady_files = sorted(input_dir.glob("*GradY.int"))
+
+    if not gradx_files:
+        raise FileNotFoundError("No *GradX.int files found.")
+    if not grady_files:
+        raise FileNotFoundError("No *GradY.int files found.")
+
+    x_map = {normalize_base_name(f): f for f in gradx_files}
+    y_map = {normalize_base_name(f): f for f in grady_files}
+
+    common_keys = sorted(set(x_map.keys()) & set(y_map.keys()))
+    if not common_keys:
+        raise RuntimeError("No matching GradX/GradY file pairs found.")
+
+    return [(x_map[k], y_map[k]) for k in common_keys]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def crop_if_needed(img: np.ndarray, border: int) -> np.ndarray:
+    if border <= 0:
+        return img
+    return img[border:-border, border:-border]
+
+
+def robust_zscore(img: np.ndarray) -> np.ndarray:
+    med = np.median(img)
+    mad = np.median(np.abs(img - med))
+
+    if mad < 1e-12:
+        std = np.std(img)
+        if std < 1e-12:
+            return np.zeros_like(img)
+        return (img - np.mean(img)) / std
+
+    return (img - med) / (1.4826 * mad)
+
+
+def build_artifact_mask(mean_gx: np.ndarray, mean_gy: np.ndarray, threshold: float):
+    mean_grad_mag = np.sqrt(mean_gx**2 + mean_gy**2)
+    z_map = robust_zscore(mean_grad_mag)
+    artifact_mask = np.abs(z_map) > threshold
+    return artifact_mask, mean_grad_mag, z_map
+
+
+def correct_masked_pixels_local_median(
+    img: np.ndarray,
+    mask: np.ndarray,
+    window: int = 2
+) -> np.ndarray:
+    """
+    Replace each masked pixel by the median of surrounding unmasked pixels.
+    window=2 means a 5x5 neighborhood.
+    """
+    corrected = img.copy()
+    h, w = corrected.shape
+
+    ys, xs = np.where(mask)
+
+    for y, x in zip(ys, xs):
+        y0 = max(0, y - window)
+        y1 = min(h, y + window + 1)
+        x0 = max(0, x - window)
+        x1 = min(w, x + window + 1)
+
+        patch = corrected[y0:y1, x0:x1]
+        patch_mask = mask[y0:y1, x0:x1]
+
+        neighbors = patch[~patch_mask]
+
+        if neighbors.size > 0:
+            corrected[y, x] = np.median(neighbors)
+
+    return corrected
+
+
+def save_map(
+    img: np.ndarray,
+    out_path: Path,
+    title: str,
+    colorbar_label: str,
+    cmap: str = "gray",
+):
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    im = ax.imshow(img, cmap=cmap, origin="upper")
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("x [pixel]", fontsize=12)
+    ax.set_ylabel("y [pixel]", fontsize=12)
+    ax.tick_params(axis="both", labelsize=10)
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(colorbar_label, fontsize=11)
+    cbar.ax.tick_params(labelsize=10)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# PHASE RECONSTRUCTION
+# ============================================================
+def reconstruct_phase_from_gradients(gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
+    """
+    Least-squares phase reconstruction from gradients by Fourier integration.
+
+    Solves approximately:
+        dphi/dx = gx
+        dphi/dy = gy
+
+    The phase is only defined up to an additive constant.
+    The mean value is set to zero.
+    """
+    ny, nx = gx.shape
+
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx)
+    ky = 2.0 * np.pi * np.fft.fftfreq(ny)
+    KX, KY = np.meshgrid(kx, ky)
+
+    GX = np.fft.fft2(gx)
+    GY = np.fft.fft2(gy)
+
+    denom = KX**2 + KY**2
+    denom[0, 0] = 1.0
+
+    PHI = (-1j * KX * GX - 1j * KY * GY) / denom
+    PHI[0, 0] = 0.0
+
+    phi = np.real(np.fft.ifft2(PHI))
+    phi -= np.mean(phi)
+
+    return phi
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    pairs = collect_pairs(INPUT_DIR)
+    print(f"Found {len(pairs)} GradX/GradY pairs.")
+
+    raw_gradx = []
+    raw_grady = []
+
+    for i, (fx, fy) in enumerate(pairs, start=1):
+        gx = read_sid4_int(fx)
+        gy = read_sid4_int(fy)
+
+        gx = crop_if_needed(gx, CROP_BORDER)
+        gy = crop_if_needed(gy, CROP_BORDER)
+
+        if gx.shape != gy.shape:
+            raise ValueError(
+                f"Shape mismatch for pair {fx.name} / {fy.name}: "
+                f"{gx.shape} vs {gy.shape}"
+            )
+
+        raw_gradx.append(gx)
+        raw_grady.append(gy)
+
+        if i <= 3:
+            print(f"Example pair {i}: {fx.name} / {fy.name}, shape = {gx.shape}")
+
+    raw_gradx = np.stack(raw_gradx, axis=0)
+    raw_grady = np.stack(raw_grady, axis=0)
+
+    print("Raw stack shapes:")
+    print("  GradX:", raw_gradx.shape)
+    print("  GradY:", raw_grady.shape)
+
+    # --------------------------------------------------------
+    # Build automatic artifact mask from raw mean gradients
+    # --------------------------------------------------------
+    mean_gx_raw = np.mean(raw_gradx, axis=0)
+    mean_gy_raw = np.mean(raw_grady, axis=0)
+
+    artifact_mask, mean_grad_mag_raw, z_map = build_artifact_mask(
+        mean_gx_raw, mean_gy_raw, threshold=ZSCORE_THRESHOLD
+    )
+
+    n_artifact_pixels = int(np.sum(artifact_mask))
+    total_pixels = artifact_mask.size
+    percentage = 100.0 * n_artifact_pixels / total_pixels
+
+    print(f"\nDetected artifact pixels: {n_artifact_pixels} / {total_pixels} ({percentage:.4f} %)")
+
+    # --------------------------------------------------------
+    # Correct all images using the same mask
+    # --------------------------------------------------------
+    corrected_gradx = []
+    corrected_grady = []
+    phase_stack = []
+
+    for i in range(raw_gradx.shape[0]):
+        gx_corr = correct_masked_pixels_local_median(
+            raw_gradx[i], artifact_mask, window=MEDIAN_WINDOW
+        )
+        gy_corr = correct_masked_pixels_local_median(
+            raw_grady[i], artifact_mask, window=MEDIAN_WINDOW
+        )
+
+        phi = reconstruct_phase_from_gradients(gx_corr, gy_corr)
+
+        corrected_gradx.append(gx_corr)
+        corrected_grady.append(gy_corr)
+        phase_stack.append(phi)
+
+    corrected_gradx = np.stack(corrected_gradx, axis=0)
+    corrected_grady = np.stack(corrected_grady, axis=0)
+    phase_stack = np.stack(phase_stack, axis=0)
+
+    # --------------------------------------------------------
+    # Final mean / std results
+    # --------------------------------------------------------
+    mean_gx_corr = np.mean(corrected_gradx, axis=0)
+    mean_gy_corr = np.mean(corrected_grady, axis=0)
+    mean_phase = np.mean(phase_stack, axis=0)
+    std_phase = np.std(phase_stack, axis=0)
+
+    # Coordinates
+    ny, nx = mean_phase.shape
+    x = np.arange(nx)
+    y = np.arange(ny)
+
+    # --------------------------------------------------------
+    # Save numerical results
+    # --------------------------------------------------------
+    np.save(OUTPUT_DIR / "artifact_mask.npy", artifact_mask.astype(np.uint8))
+    np.save(OUTPUT_DIR / "mean_gradx_raw.npy", mean_gx_raw)
+    np.save(OUTPUT_DIR / "mean_grady_raw.npy", mean_gy_raw)
+    np.save(OUTPUT_DIR / "mean_gradient_magnitude_raw.npy", mean_grad_mag_raw)
+    np.save(OUTPUT_DIR / "zscore_map.npy", z_map)
+
+    np.save(OUTPUT_DIR / "mean_gradx_corrected.npy", mean_gx_corr)
+    np.save(OUTPUT_DIR / "mean_grady_corrected.npy", mean_gy_corr)
+    np.save(OUTPUT_DIR / "phase_mean.npy", mean_phase)
+    np.save(OUTPUT_DIR / "phase_std.npy", std_phase)
+
+    np.savez(
+        OUTPUT_DIR / "phase_function_xy.npz",
+        x=x,
+        y=y,
+        phase=mean_phase,
+        phase_std=std_phase,
+    )
+
+    np.savetxt(OUTPUT_DIR / "phase_mean.csv", mean_phase, delimiter=",")
+
+    # --------------------------------------------------------
+    # Save figures
+    # --------------------------------------------------------
+    save_map(
+        mean_grad_mag_raw,
+        OUTPUT_DIR / "mean_gradient_magnitude_raw.png",
+        "Mean gradient magnitude before correction",
+        "gradient magnitude",
+        cmap="gray",
+    )
+
+    save_map(
+        z_map,
+        OUTPUT_DIR / "zscore_map.png",
+        "Robust z-score of mean gradient magnitude",
+        "robust z-score",
+        cmap="viridis",
+    )
+
+    save_map(
+        artifact_mask.astype(float),
+        OUTPUT_DIR / "artifact_mask.png",
+        "Automatic artifact mask",
+        "mask value",
+        cmap="gray",
+    )
+
+    save_map(
+        mean_gx_corr,
+        OUTPUT_DIR / "mean_gradx_corrected.png",
+        "Mean corrected phase gradient in x-direction",
+        "gradient value",
+        cmap="gray",
+    )
+
+    save_map(
+        mean_gy_corr,
+        OUTPUT_DIR / "mean_grady_corrected.png",
+        "Mean corrected phase gradient in y-direction",
+        "gradient value",
+        cmap="gray",
+    )
+
+    save_map(
+        mean_phase,
+        OUTPUT_DIR / "phase_mean.png",
+        "Mean reconstructed phase",
+        "phase value",
+        cmap="gray",
+    )
+
+    save_map(
+        std_phase,
+        OUTPUT_DIR / "phase_std.png",
+        "Standard deviation of reconstructed phase",
+        "standard deviation",
+        cmap="gray",
+    )
+
+    # --------------------------------------------------------
+    # Print strongest outliers
+    # --------------------------------------------------------
+    flat_idx = np.argsort(np.abs(z_map).ravel())[::-1][:20]
+    coords = [np.unravel_index(idx, z_map.shape) for idx in flat_idx]
+
+    print("\nTop 20 strongest outliers (y, x, z-score):")
+    for yy, xx in coords:
+        print(f"  ({yy:3d}, {xx:3d})   z = {z_map[yy, xx]:8.3f}")
+
+    print("\nFinished.")
+    print(f"Output folder: {OUTPUT_DIR}")
+    print("Main result for further calculations:")
+    print(f"  {OUTPUT_DIR / 'phase_function_xy.npz'}")
+    print(f"  {OUTPUT_DIR / 'phase_mean.npy'}")
+
+
+if __name__ == "__main__":
+    main()

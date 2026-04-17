@@ -1,0 +1,200 @@
+import re
+import struct
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =========================
+# Einstellungen
+# =========================
+DATA_DIR = Path(r"C:\Users\User\Desktop\focus scan 5 new")          # Ordner mit den .wcf-Dateien
+
+
+USE_FILENAME_AS_Z = True      # True: z aus Dateiname, z.B. 350.wcf -> 350
+Z_SCALE = 1.0                 # z-Skalierung, falls Dateinamen z.B. in mm sind
+WIDTH_SCALE = 1e-3            # 1e-3: µm -> mm, 1.0: unverändert
+SHOW_IMAGE_STRIP = True       # repräsentative Bilder unten anzeigen
+
+# DataRay WCF-Struktur
+TOP_HEADER_SIZE = 5592
+FRAME_HEADER_SIZE = 944
+
+# Offsets innerhalb des Frame-Headers
+OFFSETS = {
+    "index": 8,
+    "width": 20,
+    "height": 24,
+    "x_pixel_um": 32,
+    "y_pixel_um": 40,
+    "major_width": 216,
+    "minor_width": 224,
+    "mean_width": 232,
+    "z_location": 696,
+}
+
+def read_i32(buf, offset):
+    return struct.unpack_from("<i", buf, offset)[0]
+
+def read_f64(buf, offset):
+    return struct.unpack_from("<d", buf, offset)[0]
+
+def parse_file_z(filename: str):
+    """
+    Holt die erste Zahl aus dem Dateinamen.
+    Beispiel: '350.wcf' -> 350
+    """
+    m = re.search(r"(\d+(?:[.,]\d+)?)", filename)
+    if not m:
+        raise ValueError(f"Keine z-Position im Dateinamen gefunden: {filename}")
+    return float(m.group(1).replace(",", ".")) * Z_SCALE
+
+def read_wcf_file(path: Path):
+    """
+    Liest alle Frames einer WCF-Datei.
+    Gibt pro Frame Metadaten + Rohbild zurück.
+    """
+    frames = []
+
+    with path.open("rb") as f:
+        top = f.read(TOP_HEADER_SIZE)
+        if len(top) < TOP_HEADER_SIZE:
+            raise ValueError(f"Datei zu kurz: {path}")
+
+        # Anzahl Frames steht laut Struktur im Top-Header an DWORD #4
+        images = struct.unpack_from("<I", top, 12)[0]
+
+        for _ in range(images):
+            frame_header = f.read(FRAME_HEADER_SIZE)
+            if len(frame_header) < FRAME_HEADER_SIZE:
+                break
+
+            width = read_i32(frame_header, OFFSETS["width"])
+            height = read_i32(frame_header, OFFSETS["height"])
+            index = read_i32(frame_header, OFFSETS["index"])
+
+            x_pixel_um = read_f64(frame_header, OFFSETS["x_pixel_um"])
+            y_pixel_um = read_f64(frame_header, OFFSETS["y_pixel_um"])
+
+            major_width = read_f64(frame_header, OFFSETS["major_width"])
+            minor_width = read_f64(frame_header, OFFSETS["minor_width"])
+            mean_width = read_f64(frame_header, OFFSETS["mean_width"])
+            z_location = read_f64(frame_header, OFFSETS["z_location"])
+
+            n_pix = width * height
+            raw = f.read(n_pix * 2)
+            if len(raw) < n_pix * 2:
+                break
+
+            image = np.frombuffer(raw, dtype=np.uint16).reshape(height, width)
+
+            frames.append({
+                "index": index,
+                "width_px": width,
+                "height_px": height,
+                "x_pixel_um": x_pixel_um,
+                "y_pixel_um": y_pixel_um,
+                "major_width": major_width,
+                "minor_width": minor_width,
+                "mean_width": mean_width,
+                "z_location": z_location,
+                "image": image,
+            })
+
+    if not frames:
+        raise ValueError(f"Keine Frames gefunden in {path}")
+
+    return frames
+
+def summarize_one_file(path: Path):
+    frames = read_wcf_file(path)
+
+    # z-Position
+    if USE_FILENAME_AS_Z:
+        z = parse_file_z(path.name)
+    else:
+        z_vals = [fr["z_location"] for fr in frames if np.isfinite(fr["z_location"])]
+        z = float(np.median(z_vals)) if z_vals else np.nan
+
+    # Mittelwert über alle Frames der Datei
+    major = np.mean([fr["major_width"] for fr in frames])
+    minor = np.mean([fr["minor_width"] for fr in frames])
+    meanw = np.mean([fr["mean_width"] for fr in frames])
+
+    # Repräsentatives Bild: mittlerer Frame
+    rep = frames[len(frames) // 2]["image"]
+
+    return {
+        "file": path.name,
+        "z": z,
+        "n_frames": len(frames),
+        "major_width": major * WIDTH_SCALE,
+        "minor_width": minor * WIDTH_SCALE,
+        "mean_width": meanw * WIDTH_SCALE,
+        "image": rep,
+    }
+
+def main():
+    files = sorted(DATA_DIR.glob("*.wcf"))
+    if not files:
+        raise FileNotFoundError(f"Keine .wcf-Dateien in {DATA_DIR.resolve()} gefunden.")
+
+    results = []
+    for f in files:
+        try:
+            results.append(summarize_one_file(f))
+            print(f"OK: {f.name}")
+        except Exception as e:
+            print(f"Übersprungen: {f.name} -> {e}")
+
+    if not results:
+        raise RuntimeError("Keine Datei konnte ausgewertet werden.")
+
+    df = pd.DataFrame(results).sort_values("z").reset_index(drop=True)
+    print("\nAuswertung:")
+    print(df[["file", "z", "n_frames", "major_width", "minor_width", "mean_width"]])
+
+    # -------------------------
+    # Plot 1: Beamgröße vs z
+    # -------------------------
+    plt.figure(figsize=(9, 5))
+    plt.plot(df["z"], df["major_width"], "o-", label="Major width")
+    plt.plot(df["z"], df["minor_width"], "s-", label="Minor width")
+    plt.plot(df["z"], df["mean_width"], "^-", label="Mean width")
+
+    plt.xlabel("z")
+    plt.ylabel("Beamgröße")
+    plt.title("Beam Propagation nach der Linse")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # -------------------------
+    # Plot 2: Repräsentative Bilder
+    # -------------------------
+    if SHOW_IMAGE_STRIP:
+        n = len(df)
+        fig, axes = plt.subplots(1, n, figsize=(3 * n, 3))
+        if n == 1:
+            axes = [axes]
+
+        vmin = min(np.min(img) for img in df["image"])
+        vmax = max(np.max(img) for img in df["image"])
+
+        for ax, (_, row) in zip(axes, df.iterrows()):
+            ax.imshow(row["image"], origin="lower", cmap="inferno", vmin=vmin, vmax=vmax)
+            ax.set_title(f"z = {row['z']}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        fig.suptitle("Repräsentative Beam-Profile")
+        plt.tight_layout()
+        plt.show()
+
+    # Optional speichern
+    df.drop(columns=["image"]).to_csv("beam_propagation_summary.csv", index=False)
+    print("\nCSV gespeichert: beam_propagation_summary.csv")
+
+if __name__ == "__main__":
+    main()

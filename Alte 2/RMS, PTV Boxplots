@@ -1,0 +1,91 @@
+import os
+import xml.etree.ElementTree as ET
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# ==========================================
+# ORDNERPFAD EINTRAGEN
+# ==========================================
+
+folder_path = r"C:\Users\User\Desktop\Auswertung"
+
+# ==========================================
+# Listen für Werte
+# ==========================================
+
+rms_values = []
+ptv_values = []
+
+defocus_values = []
+astig_values = []
+
+# ==========================================
+# XML-Dateien durchsuchen
+# ==========================================
+
+
+files = [f for f in os.listdir(folder_path) if f.endswith('.xml')]
+
+for file in files:
+    filepath = os.path.join(folder_path, file)
+
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+
+    current_label = None
+
+    for elem in root.iter():
+
+        if elem.tag == 'Label':
+            current_label = elem.text
+
+        if elem.tag == 'Value' and current_label is not None:
+            try:
+                value = float(elem.text)
+
+                if current_label == 'RMS Phase':
+                    rms_values.append(value)
+
+                elif current_label == 'PtV Phase':
+                    ptv_values.append(value)
+
+                elif current_label == 'Defocus':
+                    defocus_values.append(value)
+
+                elif current_label == 'Astig 0_deg':
+                    astig_values.append(value)
+
+            except:
+                pass
+
+# ==========================================
+# Statistik
+# ==========================================
+
+def print_stats(name, values):
+    print(f"\n{name}")
+    print(f"Mittelwert: {np.mean(values):.4f}")
+    print(f"Standardabweichung: {np.std(values):.4f}")
+
+print_stats("RMS Phase", rms_values)
+print_stats("PtV Phase", ptv_values)
+print_stats("Defocus", defocus_values)
+print_stats("Astig 0_deg", astig_values)
+
+# ==========================================
+# Boxplots
+# ==========================================
+
+data = [rms_values, ptv_values, defocus_values, astig_values]
+
+labels = ['RMS', 'PtV', 'Defocus', 'Astig']
+
+plt.figure(figsize=(10,6))
+plt.boxplot(data, labels=labels)
+
+plt.title("Phasics-Auswertung")
+plt.ylabel("Wert")
+plt.grid(True)
+
+plt.show()

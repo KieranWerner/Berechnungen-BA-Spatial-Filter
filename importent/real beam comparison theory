@@ -1,0 +1,544 @@
+from __future__ import annotations
+
+import csv
+import math
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+# ============================================================
+# KONFIGURATION
+# ============================================================
+
+CFG = {
+    # Ordner mit den realen .wcf-Dateien
+    "REAL_WCF_FOLDER": Path(r"C:\Users\User\Desktop\2D Beamprofiler lens"),
+
+    # Theorie-CSV aus deinem Theorie-Skript
+    "THEORY_CSV": Path(r"C:\Users\User\Desktop\Theory_lens_5m\theory_lens_5m_beam_size_vs_z.csv"),
+
+    # Ausgabeordner
+    "OUTPUT_DIR": Path(r"C:\Users\User\Desktop\Compare_theory_vs_real"),
+
+    # Reale Skalierung:
+    # 11 px/mm  ->  1 px = 1/11 mm
+    "REAL_PX_PER_MM": 11.0,
+    "THEORY_SCALE": 2.0,
+
+    # Kandidaten für Start des Pixelblocks in WCF
+    "CANDIDATE_PIXEL_OFFSETS": [944, 960, 992, 1024, 1152, 1200],
+
+    # Area-Definitionen relativ zum Peak
+    "REL_THRESHOLDS": {
+        "D_area_50pct": 0.50,
+        "D_area_13p5pct": math.exp(-2.0),
+    },
+
+    # Encircled energy
+    "EE_TARGETS": {
+        "D_EE50": 0.50,
+        "D_EE86": 0.865,
+    },
+
+    # Was geplottet werden soll
+    "PLOT_KEYS": [
+        "D4sigma_avg",
+        "D_EE86",
+        "D_area_50pct",
+        "D_area_13p5pct",
+    ],
+
+    # Interpolation:
+    # True  -> Theorie wird auf reale z-Positionen interpoliert
+    # False -> nur gemeinsame exakte z-Werte werden verwendet
+    "INTERPOLATE_THEORY_TO_REAL_Z": True,
+}
+
+
+# ============================================================
+# HILFSFUNKTIONEN: WCF / REALDATEN
+# ============================================================
+
+def u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 4], "little", signed=False)
+
+
+def parse_z_from_filename(path: Path) -> float:
+    """
+    Extrahiert z aus Dateinamen wie:
+    350.wcf, 350cm.wcf, z_350.wcf, scan_350_cm.wcf
+
+    Annahme für reale Daten:
+    Dateiname enthält z in cm.
+    Rückgabe in m.
+    """
+    stem = path.stem.replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)", stem)
+    if not m:
+        raise ValueError(f"Keine z-Position im Dateinamen gefunden: {path.name}")
+    z_cm = float(m.group(1))
+    return z_cm / 100.0
+
+
+def border_values(img: np.ndarray, border: int = 40) -> np.ndarray:
+    top = img[:border, :]
+    bottom = img[-border:, :]
+    left = img[:, :border]
+    right = img[:, -border:]
+    return np.concatenate([top.ravel(), bottom.ravel(), left.ravel(), right.ravel()])
+
+
+def choose_pixel_offset(frame_bytes: bytes, width: int, height: int, candidates: list[int]) -> int:
+    """
+    Wählt den plausibelsten Offset für den Pixelblock.
+    """
+    best_offset = None
+    best_score = np.inf
+
+    npx = width * height
+    need = npx * 2
+
+    for off in candidates:
+        if off + need > len(frame_bytes):
+            continue
+
+        img = np.frombuffer(
+            frame_bytes, dtype="<u2", count=npx, offset=off
+        ).reshape(height, width).astype(np.float64)
+
+        b = border_values(img, border=min(40, width // 8, height // 8))
+        center = img[height // 4: 3 * height // 4, width // 4: 3 * width // 4]
+
+        border_mean = float(np.mean(b))
+        center_mean = float(np.mean(center))
+        max_y, max_x = np.unravel_index(np.argmax(img), img.shape)
+
+        on_edge = (max_x < 5 or max_x >= width - 5 or max_y < 5 or max_y >= height - 5)
+        score = border_mean / max(center_mean, 1e-12)
+        if on_edge:
+            score += 0.5
+
+        if score < best_score:
+            best_score = score
+            best_offset = off
+
+    if best_offset is None:
+        raise RuntimeError("Kein plausibler Pixel-Offset im WCF-Frame gefunden.")
+
+    return best_offset
+
+
+def read_wcf_mean_image(path: Path, candidate_offsets: list[int]) -> np.ndarray:
+    """
+    Liest eine DataRay-artige WCF-Datei und mittelt alle nutzbaren Frames.
+    """
+    data = path.read_bytes()
+
+    if not data.startswith(b".IRD"):
+        raise RuntimeError(f"{path.name}: Unbekannter WCF-Header (erwartet '.IRD').")
+
+    global_header = u32(data, 8)
+    nominal_frames = u32(data, 12)
+    frame_size = u32(data, 16)
+
+    if global_header <= 0 or frame_size <= 0:
+        raise RuntimeError(f"{path.name}: Ungültiger WCF-Header.")
+
+    if len(data) < global_header + 256:
+        raise RuntimeError(f"{path.name}: Datei zu kurz.")
+
+    first_frame_offset = global_header
+    width = u32(data, first_frame_offset + 20)
+    height = u32(data, first_frame_offset + 24)
+
+    if width <= 0 or height <= 0 or width * height > 10000 * 10000:
+        raise RuntimeError(f"{path.name}: Unplausible Bildgröße: {width} x {height}")
+
+    usable_frames = max(1, min(nominal_frames, (len(data) - global_header) // frame_size))
+
+    first_frame_end = min(len(data), first_frame_offset + frame_size)
+    first_frame = data[first_frame_offset:first_frame_end]
+    pixel_offset = choose_pixel_offset(first_frame, width, height, candidate_offsets)
+
+    acc = np.zeros((height, width), dtype=np.float64)
+    used = 0
+    bytes_needed = pixel_offset + width * height * 2
+
+    for i in range(usable_frames):
+        f0 = global_header + i * frame_size
+        f1 = min(len(data), f0 + frame_size)
+        frame = data[f0:f1]
+        if len(frame) < bytes_needed:
+            continue
+
+        img = np.frombuffer(
+            frame, dtype="<u2", count=width * height, offset=pixel_offset
+        ).reshape(height, width)
+
+        acc += img
+        used += 1
+
+    if used == 0:
+        raise RuntimeError(f"{path.name}: Kein vollständiger Frame lesbar.")
+
+    return acc / used
+
+
+def subtract_background(img: np.ndarray) -> np.ndarray:
+    bg = np.percentile(img, 8)
+    out = img.astype(np.float64) - bg
+    out[out < 0] = 0.0
+    return out
+
+
+def weighted_centroid(img: np.ndarray) -> tuple[float, float]:
+    total = float(img.sum())
+    if total <= 0:
+        raise RuntimeError("Bild hat nach Hintergrundabzug keine positive Intensität.")
+
+    y, x = np.indices(img.shape)
+    cx = float((img * x).sum() / total)
+    cy = float((img * y).sum() / total)
+    return cx, cy
+
+
+def second_moment_diameter_avg(img: np.ndarray) -> dict[str, float]:
+    total = float(img.sum())
+    y, x = np.indices(img.shape)
+    cx, cy = weighted_centroid(img)
+
+    dx = x - cx
+    dy = y - cy
+
+    sigma_x = math.sqrt(float((img * dx**2).sum() / total))
+    sigma_y = math.sqrt(float((img * dy**2).sum() / total))
+
+    d4sx = 4.0 * sigma_x
+    d4sy = 4.0 * sigma_y
+    d4s_avg = 0.5 * (d4sx + d4sy)
+
+    return {"D4sigma_avg": d4s_avg}
+
+
+def encircled_energy_diameter(img: np.ndarray, fraction: float) -> float:
+    cx, cy = weighted_centroid(img)
+    y, x = np.indices(img.shape)
+    r = np.sqrt((x - cx)**2 + (y - cy)**2)
+
+    order = np.argsort(r.ravel())
+    r_sorted = r.ravel()[order]
+    i_sorted = img.ravel()[order]
+
+    cum = np.cumsum(i_sorted)
+    total = cum[-1]
+    target = fraction * total
+
+    idx = int(np.searchsorted(cum, target))
+    idx = min(max(idx, 0), len(r_sorted) - 1)
+    return 2.0 * float(r_sorted[idx])
+
+
+def area_equivalent_diameter(img: np.ndarray, rel_threshold: float) -> float:
+    peak = float(np.max(img))
+    if peak <= 0:
+        return np.nan
+    mask = img >= (rel_threshold * peak)
+    area = float(np.count_nonzero(mask))
+    if area <= 0:
+        return np.nan
+    return 2.0 * math.sqrt(area / math.pi)
+
+
+def compute_real_metrics_px(img: np.ndarray, ee_targets: dict[str, float], rel_thresholds: dict[str, float]) -> dict[str, float]:
+    img2 = subtract_background(img)
+
+    metrics = {}
+    metrics.update(second_moment_diameter_avg(img2))
+
+    for name, frac in ee_targets.items():
+        metrics[name] = encircled_energy_diameter(img2, frac)
+
+    for name, thr in rel_thresholds.items():
+        metrics[name] = area_equivalent_diameter(img2, thr)
+
+    return metrics
+
+
+def px_to_mm(values: dict[str, float], px_per_mm: float) -> dict[str, float]:
+    mm_per_px = 1.0 / px_per_mm
+    return {k: v * mm_per_px for k, v in values.items()}
+
+
+def load_real_data() -> list[dict[str, float]]:
+    folder = Path(CFG["REAL_WCF_FOLDER"]).expanduser()
+    if not folder.exists():
+        raise SystemExit(f"Ordner mit realen WCF-Dateien nicht gefunden: {folder}")
+
+    files = sorted(folder.glob("*.wcf"))
+    if not files:
+        raise SystemExit(f"Keine .wcf-Dateien gefunden in: {folder}")
+
+    rows = []
+    for path in files:
+        z_m = parse_z_from_filename(path)
+        img = read_wcf_mean_image(path, CFG["CANDIDATE_PIXEL_OFFSETS"])
+        metrics_px = compute_real_metrics_px(
+            img,
+            CFG["EE_TARGETS"],
+            CFG["REL_THRESHOLDS"],
+        )
+        metrics_mm = px_to_mm(metrics_px, float(CFG["REAL_PX_PER_MM"]))
+
+        row = {"file": path.name, "z_m": z_m}
+        row.update(metrics_mm)
+        rows.append(row)
+        print(f"REAL OK: {path.name}")
+
+    rows.sort(key=lambda r: r["z_m"])
+    return rows
+
+
+# ============================================================
+# HILFSFUNKTIONEN: THEORIE-DATEN
+# ============================================================
+
+def load_theory_csv(path: Path) -> list[dict[str, float]]:
+    if not path.exists():
+        raise SystemExit(f"Theorie-CSV nicht gefunden: {path}")
+
+    rows = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            row = {}
+
+            # z
+            if "z_m" in raw and raw["z_m"] != "":
+                row["z_m"] = float(raw["z_m"])* CFG["THEORY_SCALE"]
+            elif "z_cm" in raw and raw["z_cm"] != "":
+                row["z_m"] = float(raw["z_cm"]) / 100.0* CFG["THEORY_SCALE"]
+            else:
+                raise ValueError("In der Theorie-CSV wurde keine Spalte 'z_m' oder 'z_cm' gefunden.")
+
+            # mögliche Namensvarianten
+            mapping = {
+                "D4sigma_avg": ["D4sigma_avg_mm", "D4sigma_avg"],
+                "D_EE50": ["D_EE50_mm", "D_EE50"],
+                "D_EE86": ["D_EE86_mm", "D_EE86"],
+                "D_area_50pct": ["D_area_50pct_mm", "D_area_50pct"],
+                "D_area_13p5pct": ["D_area_13p5pct_mm", "D_area_13p5pct"],
+            }
+
+            for target_key, candidates in mapping.items():
+                found = False
+                for c in candidates:
+                    if c in raw and raw[c] not in ("", None):
+                        row[target_key] = float(raw[c])
+                        found = True
+                        break
+                if not found:
+                    row[target_key] = np.nan
+
+            rows.append(row)
+
+    if not rows:
+        raise SystemExit("Theorie-CSV ist leer.")
+
+    rows.sort(key=lambda r: r["z_m"])
+    return rows
+
+
+# ============================================================
+# VERGLEICH / INTERPOLATION
+# ============================================================
+
+def interpolate_theory_to_real_z(
+    theory_rows: list[dict[str, float]],
+    real_rows: list[dict[str, float]],
+    keys: list[str],
+) -> list[dict[str, float]]:
+    z_theory = np.array([r["z_m"] for r in theory_rows], dtype=float)
+    z_real = np.array([r["z_m"] for r in real_rows], dtype=float)
+
+    out = []
+    for i, zr in enumerate(z_real):
+        row = {
+            "z_m": zr,
+            "file": real_rows[i].get("file", ""),
+        }
+
+        for key in keys:
+            y_theory = np.array([r[key] for r in theory_rows], dtype=float)
+            y_real = float(real_rows[i][key])
+
+            valid = np.isfinite(z_theory) & np.isfinite(y_theory)
+            if np.count_nonzero(valid) < 2:
+                row[f"{key}_theory"] = np.nan
+                row[f"{key}_real"] = y_real
+                row[f"{key}_diff"] = np.nan
+                continue
+
+            zt = z_theory[valid]
+            yt = y_theory[valid]
+
+            if zr < np.min(zt) or zr > np.max(zt):
+                theory_val = np.nan
+            else:
+                theory_val = float(np.interp(zr, zt, yt))
+
+            row[f"{key}_theory"] = theory_val
+            row[f"{key}_real"] = y_real
+            row[f"{key}_diff"] = theory_val - y_real if np.isfinite(theory_val) else np.nan
+
+        out.append(row)
+
+    return out
+
+
+def exact_match_theory_and_real(
+    theory_rows: list[dict[str, float]],
+    real_rows: list[dict[str, float]],
+    keys: list[str],
+    tol: float = 1e-9,
+) -> list[dict[str, float]]:
+    out = []
+    for rr in real_rows:
+        zr = rr["z_m"]
+        match = None
+        for tr in theory_rows:
+            if abs(tr["z_m"] - zr) <= tol:
+                match = tr
+                break
+
+        if match is None:
+            continue
+
+        row = {
+            "z_m": zr,
+            "file": rr.get("file", ""),
+        }
+        for key in keys:
+            theory_val = float(match.get(key, np.nan))
+            real_val = float(rr.get(key, np.nan))
+            row[f"{key}_theory"] = theory_val
+            row[f"{key}_real"] = real_val
+            row[f"{key}_diff"] = theory_val - real_val
+        out.append(row)
+
+    return out
+
+
+# ============================================================
+# AUSGABE
+# ============================================================
+
+def save_comparison_csv(rows: list[dict[str, float]], output_dir: Path) -> Path:
+    if not rows:
+        raise RuntimeError("Keine Vergleichsdaten zum Speichern vorhanden.")
+
+    out = output_dir / "theory_minus_real_comparison.csv"
+    fieldnames = list(rows[0].keys())
+
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return out
+
+
+def plot_difference(rows: list[dict[str, float]], keys: list[str], output_dir: Path) -> Path:
+    z = np.array([r["z_m"] for r in rows], dtype=float)
+
+    plt.figure(figsize=(11, 7))
+    for key in keys:
+        y = np.array([r[f"{key}_diff"] for r in rows], dtype=float)
+        plt.plot(z, y, marker="o", linewidth=2, label=f"{key}: Theorie - Real")
+
+    plt.axhline(0.0, linewidth=1.2, linestyle="--")
+    plt.xlabel("z [m]")
+    plt.ylabel("Differenz [mm]")
+    plt.title("Differenz zwischen Theorie und Realdaten")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out = output_dir / "theory_minus_real_plot.png"
+    plt.savefig(out, dpi=220)
+    plt.show()
+    return out
+
+
+def plot_theory_and_real_overlay(rows: list[dict[str, float]], keys: list[str], output_dir: Path) -> Path:
+    z = np.array([r["z_m"] for r in rows], dtype=float)
+
+    plt.figure(figsize=(12, 8))
+    for key in keys:
+        y_theory = np.array([r[f"{key}_theory"] for r in rows], dtype=float)
+        y_real = np.array([r[f"{key}_real"] for r in rows], dtype=float)
+
+        plt.plot(z, y_theory, marker="o", linewidth=2, label=f"{key} Theorie")
+        plt.plot(z, y_real, marker="x", linewidth=1.5, linestyle="--", label=f"{key} Real")
+
+    plt.xlabel("z [m]")
+    plt.ylabel("Beam size [mm]")
+    plt.title("Theorie und Realdaten im direkten Vergleich")
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=2)
+    plt.tight_layout()
+
+    out = output_dir / "theory_and_real_overlay.png"
+    plt.savefig(out, dpi=220)
+    plt.close()
+    return out
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    output_dir = Path(CFG["OUTPUT_DIR"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    theory_rows = load_theory_csv(Path(CFG["THEORY_CSV"]))
+    real_rows = load_real_data()
+
+    keys = list(CFG["PLOT_KEYS"])
+
+    if CFG["INTERPOLATE_THEORY_TO_REAL_Z"]:
+        comparison_rows = interpolate_theory_to_real_z(theory_rows, real_rows, keys)
+    else:
+        comparison_rows = exact_match_theory_and_real(theory_rows, real_rows, keys)
+
+    if not comparison_rows:
+        raise SystemExit("Keine gemeinsamen Vergleichsdaten gefunden.")
+
+    csv_path = save_comparison_csv(comparison_rows, output_dir)
+    diff_plot_path = plot_difference(comparison_rows, keys, output_dir)
+    overlay_plot_path = plot_theory_and_real_overlay(comparison_rows, keys, output_dir)
+
+    print()
+    print("=" * 80)
+    print("VERGLEICH FERTIG")
+    print("=" * 80)
+    print(f"Realdaten-Skalierung:     {CFG['REAL_PX_PER_MM']} px/mm")
+    print(f"Realdaten in mm:          1 px = {1.0 / float(CFG['REAL_PX_PER_MM']):.6f} mm")
+    print(f"Vergleichs-CSV:           {csv_path}")
+    print(f"Differenz-Plot:           {diff_plot_path}")
+    print(f"Overlay-Plot:             {overlay_plot_path}")
+    print()
+    print("Differenz ist definiert als:")
+    print("    Theorie - Real")
+    print()
+    if CFG["INTERPOLATE_THEORY_TO_REAL_Z"]:
+        print("Die Theoriedaten wurden auf die realen z-Positionen interpoliert.")
+    else:
+        print("Es wurden nur exakt gleiche z-Positionen verwendet.")
+
+
+if __name__ == "__main__":
+    main()
